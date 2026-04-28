@@ -24,6 +24,7 @@ const (
 	CommandEnter   Command = "enter"
 	CommandLogs    Command = "logs"
 	CommandRestart Command = "restart"
+	CommandBuild   Command = "build"
 )
 
 // ErrServiceRequired is returned when a command requires a service but none was provided
@@ -54,6 +55,34 @@ func (r *Runner) Run(cmd Command, service string) error {
 	default:
 		return fmt.Errorf("unknown command: %s", cmd)
 	}
+}
+
+// Build builds a Docker image from a Dockerfile
+func (r *Runner) Build(dockerfile string, args map[string]string, tag string) error {
+	buildArgs := []string{"build", "-f", dockerfile}
+
+	// Add build args
+	for name, value := range args {
+		buildArgs = append(buildArgs, "--build-arg", fmt.Sprintf("%s=%s", name, value))
+	}
+
+	// Add tag if provided
+	if tag != "" {
+		buildArgs = append(buildArgs, "-t", tag)
+	}
+
+	// Add context (current directory)
+	buildArgs = append(buildArgs, ".")
+
+	cmd := exec.Command("nerdctl", buildArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to build image from %s: %w", dockerfile, err)
+	}
+	return nil
 }
 
 // runCompose runs a nerdctl compose command
@@ -104,11 +133,3 @@ func (r *Runner) logs(service string) error {
 	return nil
 }
 
-// CheckNerdctl checks if nerdctl is available
-func (r *Runner) CheckNerdctl() error {
-	cmd := exec.Command("nerdctl", "version")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("nerdctl not found: %w", err)
-	}
-	return nil
-}
