@@ -1,5 +1,6 @@
 # Binary
 nd
+dist/
 *.exe
 *.exe~
 *.dll
@@ -30,6 +31,9 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Dependencies
+node_modules/
 
 # Temporary files
 *.tmp

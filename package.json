@@ -1,0 +1,21 @@
+{
+  "name": "nd",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "mkdir -p dist && bun build ./index.ts --compile --outfile dist/nd",
+    "start": "bun run index.ts",
+    "check": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "ink": "^7.0.1",
+    "react": "^19.2.5",
+    "react-devtools-core": "^7.0.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14",
+    "typescript": "^6.0.3"
+  }
+}
