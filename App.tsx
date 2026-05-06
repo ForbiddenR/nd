@@ -782,8 +782,9 @@ function invalidArgs(error: string): ParsedArgs {
 
 function readTag(configPath: string): string | null {
   try {
-    const parsed = JSON.parse(readFileSync(configPath, "utf-8"));
-    return typeof parsed === "string" ? parsed : null;
+    const { tag } = JSON.parse(readFileSync(configPath, "utf-8"));
+
+    return tag && typeof tag === "string" ? tag : null;
   } catch {
     return null;
   }
