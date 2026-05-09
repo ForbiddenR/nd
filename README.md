@@ -38,21 +38,24 @@ The TUI shows the build context and Dockerfile path, discovers Dockerfile `ARG` 
 
 ## Configuration
 
-`nd` reads `nd.json` from the selected build context:
+`nd` reads `.nd.json` from the selected build context:
 
 ```json
 {
-  "tag": "my-image:latest"
+  "tag": "my-image:latest",
+  "versionCheckUrl": "https://registry.npmjs.org/nd"
 }
 ```
 
 Tag priority:
 
 1. `--tag` / `-t`
-2. `nd.json` `tag`
+2. `.nd.json` `tag`
 3. generated folder-name fallback
 
-After a successful build, `nd` updates `nd.json` with the final validated tag from the TUI.
+`versionCheckUrl` is optional. When set, it must point to npm-compatible package metadata. On startup, `nd` checks `dist-tags.latest`, uses that version for the generated fallback image tag when no tag is provided, and shows a non-blocking update notice if a newer version exists. Version check failures are ignored.
+
+After a successful build, `nd` updates `.nd.json` with the final validated tag from the TUI while preserving other config keys.
 
 ## TUI controls
 

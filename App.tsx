@@ -3,6 +3,7 @@ import { basename, join, resolve } from "node:path";
 import { readFileSync, writeFileSync } from "node:fs";
 import { Box, Text, useApp, useInput } from "ink";
 import { startDockerBuild, type DockerBuildArg, type DockerBuildRun } from "./dockerBuild.ts";
+import packageJson from "./package.json" with { type: "json" };
 
 const MAX_OUTPUT_LINES = 80;
 const BUILD_ARG_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -21,8 +22,8 @@ type ParsedArgs = {
   contextDir: string;
   dockerfilePath: string;
   configPath: string;
-  imageTag: string;
   error: string | null;
+  config: Config;
 };
 
 type BuildArgDefinition = {
@@ -41,6 +42,7 @@ type BuildArgValue = {
 
 type EditField =
   | { kind: "tag" }
+  | { kind: "init" }
   | { kind: "arg"; index: number };
 
 type EditState = {
@@ -50,12 +52,16 @@ type EditState = {
 } | null;
 
 type BuildConfig = {
-  imageTag: string;
   buildArgs: DockerBuildArg[];
 };
 
-type NdConfig = Record<string, unknown> & {
+type Config = Record<string, unknown> & {
   tag?: string;
+  versionCheckUrl?: string;
+};
+
+type NpmMetadata = {
+  latest: string;
 };
 
 type AppProps = {
@@ -66,8 +72,10 @@ export function App({ argv }: AppProps) {
   const { exit } = useApp();
   const inputIsActive = useMemo(() => supportsRawInput(), []);
   const parsed = useMemo(() => parseArgs(argv), [argv]);
+  const [lastTag, setLastTag] = useState(parsed.config.tag ?? "");
+  const [version, setVersion] = useState<string | null>(null);
+  const imageTag = useMemo(() => `${lastTag}:v${version ?? "latest"}`, [lastTag, version]);
   const [phase, setPhase] = useState<Phase>(parsed.error ? "invalid" : "checking");
-  const [imageTag, setImageTag] = useState(parsed.imageTag);
   const [buildArgs, setBuildArgs] = useState<BuildArgValue[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [editState, setEditState] = useState<EditState>(null);
@@ -75,9 +83,13 @@ export function App({ argv }: AppProps) {
   const [outputLines, setOutputLines] = useState<string[]>([]);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(parsed.error);
+  const [canBuild, setCanBuild] = useState(parsed.config.tag ? true : false);
+  const [inputPrefix, setInputPrefix] = useState("");
   const buildRunRef = useRef<DockerBuildRun | null>(null);
   const buildConfigRef = useRef<BuildConfig | null>(null);
+  const fetchedDefaultVersionRef = useRef<string | null>(null);
   const cancelledRef = useRef(false);
+
 
   const buildIndex = buildArgs.length + 1;
 
@@ -109,7 +121,6 @@ export function App({ argv }: AppProps) {
     }
 
     buildConfigRef.current = {
-      imageTag,
       buildArgs: enabledBuildArgs,
     };
 
@@ -133,8 +144,13 @@ export function App({ argv }: AppProps) {
   const startEditingSelected = useCallback(() => {
     setValidationError(null);
 
+    if (!canBuild) {
+      setEditState({ field: { kind: "init" }, draft: inputPrefix, cursor: inputPrefix.length });
+      return;
+    }
+
     if (selectedIndex === 0) {
-      setEditState({ field: { kind: "tag" }, draft: imageTag, cursor: imageTag.length });
+      setEditState({ field: { kind: "tag" }, draft: parsed.config.tag ?? "", cursor: parsed.config.tag?.length ?? 0 });
       return;
     }
 
@@ -148,31 +164,31 @@ export function App({ argv }: AppProps) {
     setEditState({ field: { kind: "arg", index: argIndex }, draft: arg.value, cursor: arg.value.length });
   }, [buildArgs, imageTag, selectedIndex]);
 
-  const saveEdit = useCallback(() => {
-    if (!editState) {
-      return;
-    }
+  // const saveEdit = useCallback(() => {
+  //   if (!editState) {
+  //     return;
+  //   }
 
-    if (editState.field.kind === "tag") {
-      setImageTag(editState.draft);
-      setEditState(null);
-      setValidationError(null);
-      return;
-    }
+  //   if (editState.field.kind === "tag") {
+  //     setImageTag(editState.draft);
+  //     setEditState(null);
+  //     setValidationError(null);
+  //     return;
+  //   }
 
-    const fieldIndex = editState.field.index;
-    const draft = editState.draft;
+  //   const fieldIndex = editState.field.index;
+  //   const draft = editState.draft;
 
-    setBuildArgs((current) => current.map((arg, index) => {
-      if (index !== fieldIndex) {
-        return arg;
-      }
+  //   setBuildArgs((current) => current.map((arg, index) => {
+  //     if (index !== fieldIndex) {
+  //       return arg;
+  //     }
 
-      return { ...arg, value: draft, enabled: true };
-    }));
-    setEditState(null);
-    setValidationError(null);
-  }, [editState]);
+  //     return { ...arg, value: draft, enabled: true };
+  //   }));
+  //   setEditState(null);
+  //   setValidationError(null);
+  // }, [editState]);
 
   const toggleSelectedArg = useCallback(() => {
     const argIndex = selectedIndex - 1;
@@ -190,6 +206,32 @@ export function App({ argv }: AppProps) {
       return { ...arg, enabled: !arg.enabled };
     }));
   }, [buildArgs.length, selectedIndex]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const versionCheckUrl = parsed.config.versionCheckUrl;
+    if (!versionCheckUrl) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+
+    checkLatestVersion(versionCheckUrl, controller.signal)
+      .then((result) => {
+        if (!cancelled && result) {
+          fetchedDefaultVersionRef.current = result;
+          setVersion(result);
+        }
+      })
+      .catch(() => { });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [parsed.configPath, parsed.contextDir]);
 
   useEffect(() => {
     if (parsed.error) {
@@ -223,8 +265,6 @@ export function App({ argv }: AppProps) {
         if (cancelled) {
           return;
         }
-
-        setImageTag(parsed.imageTag);
         setBuildArgs(definitions.map((definition) => ({
           name: definition.name,
           defaultValue: definition.defaultValue,
@@ -247,7 +287,15 @@ export function App({ argv }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [parsed.contextDir, parsed.dockerfilePath, parsed.error, parsed.imageTag]);
+  }, [parsed.contextDir, parsed.dockerfilePath, parsed.error]);
+
+  useEffect(() => {
+    if (lastTag !== "") {
+      Bun.file(parsed.configPath)
+        .write(JSON.stringify({ ...parsed.config, tag: lastTag }, null, 2))
+        .catch((e) => { process.stderr.write(`Failed to update .nd.json with new tag: ${e instanceof Error ? e.message : String(e)}\n`); });
+    }
+  }, [lastTag])
 
   useEffect(() => {
     if (phase !== "building" || buildRunRef.current) {
@@ -268,7 +316,7 @@ export function App({ argv }: AppProps) {
     const run = startDockerBuild({
       contextDir: parsed.contextDir,
       dockerfilePath: parsed.dockerfilePath,
-      imageTag: buildConfig.imageTag,
+      imageTag: imageTag,
       buildArgs: buildConfig.buildArgs,
       onOutput: appendOutput,
     });
@@ -293,12 +341,12 @@ export function App({ argv }: AppProps) {
         }
 
         try {
-          writeNdConfig(parsed.configPath, buildConfig.imageTag);
+          writeFileSync(parsed.configPath, JSON.stringify(parsed.config))
         } catch (reason: unknown) {
           process.exitCode = 1;
           setError(reason instanceof Error
-            ? `Build succeeded, but failed to update nd.json: ${reason.message}`
-            : `Build succeeded, but failed to update nd.json: ${String(reason)}`);
+            ? `Build succeeded, but failed to update .nd.json: ${reason.message}`
+            : `Build succeeded, but failed to update .nd.json: ${String(reason)}`);
           setPhase("failed");
           return;
         }
@@ -352,6 +400,15 @@ export function App({ argv }: AppProps) {
       }
 
       if (phase === "review") {
+        if (!canBuild) {
+          if (key.return && inputPrefix !== "") {
+            setLastTag(inputPrefix);
+            setCanBuild(true);
+            return;
+          }
+          setEditState((current) => editInput(current, input, key));
+        }
+
         if (editState) {
           if (key.escape) {
             setEditState(null);
@@ -359,7 +416,7 @@ export function App({ argv }: AppProps) {
           }
 
           if (key.return) {
-            saveEdit();
+            // saveEdit();
             return;
           }
 
@@ -427,6 +484,7 @@ export function App({ argv }: AppProps) {
           selectedIndex={selectedIndex}
           editState={editState}
           validationError={validationError}
+          canBuild={canBuild}
         />
       ) : (
         <PhaseView
@@ -455,50 +513,58 @@ function ReviewEditor({
   selectedIndex,
   editState,
   validationError,
+  canBuild,
 }: {
   imageTag: string;
   buildArgs: BuildArgValue[];
   selectedIndex: number;
   editState: EditState;
   validationError: string | null;
+  canBuild: boolean;
 }) {
   const buildIndex = buildArgs.length + 1;
 
   return (
     <Box flexDirection="column">
       <Text bold>Build options</Text>
-      <FieldRow selected={selectedIndex === 0} label="Tag" value={imageTag} editing={editState?.field.kind === "tag"} draft={editState?.field.kind === "tag" ? editState.draft : null} cursor={editState?.field.kind === "tag" ? editState.cursor : null} />
-      {buildArgs.length === 0 ? (
-        <Text dimColor>No Dockerfile ARG values found.</Text>
-      ) : (
-        buildArgs.map((arg, index) => (
-          <FieldRow
-            key={arg.name}
-            selected={selectedIndex === index + 1}
-            label={`ARG ${arg.name}`}
-            value={formatBuildArgValue(arg)}
-            editing={editState?.field.kind === "arg" && editState.field.index === index}
-            draft={editState?.field.kind === "arg" && editState.field.index === index ? editState.draft : null}
-            cursor={editState?.field.kind === "arg" && editState.field.index === index ? editState.cursor : null}
-            suffix={arg.occurrences > 1 ? `declared ${arg.occurrences} times` : null}
-          />
-        ))
-      )}
-      <Text color={selectedIndex === buildIndex ? "cyan" : undefined}>{selectedIndex === buildIndex ? "› " : "  "}[Start build]</Text>
-      {validationError ? <Text color="red">{validationError}</Text> : null}
-      {editState ? (
-        <Box flexDirection="column">
-          <Text dimColor>Type to edit. Enter saves. Esc cancels.</Text>
-          <Text dimColor>Left/Right move cursor. Home/End or Ctrl+A/Ctrl+E jump. Ctrl+U clears.</Text>
-        </Box>
-      ) : (
-        <Box flexDirection="column">
-          <Text dimColor>Up/Down or Tab moves. Enter/e edits. Space toggles ARG. b builds.</Text>
-          <Text dimColor>Press q or Esc to quit.</Text>
-        </Box>
-      )}
-    </Box>
-  );
+      {
+        canBuild ? (
+          <>
+            <Text color={selectedIndex === buildIndex ? "cyan" : undefined}>{selectedIndex === buildIndex ? "› " : "  "}[Start build]</Text>
+            <FieldRow selected={selectedIndex === 0} label="Tag" value={imageTag} editing={editState?.field.kind === "tag"} draft={editState?.field.kind === "tag" ? editState.draft : null} cursor={editState?.field.kind === "tag" ? editState.cursor : null} />
+            {buildArgs.length === 0 ? (
+              <Text dimColor>No Dockerfile ARG values found.</Text>
+            ) : (
+              buildArgs.map((arg, index) => (
+                <FieldRow
+                  key={arg.name}
+                  selected={selectedIndex === index + 1}
+                  label={`ARG ${arg.name}`}
+                  value={formatBuildArgValue(arg)}
+                  editing={editState?.field.kind === "arg" && editState.field.index === index}
+                  draft={editState?.field.kind === "arg" && editState.field.index === index ? editState.draft : null}
+                  cursor={editState?.field.kind === "arg" && editState.field.index === index ? editState.cursor : null}
+                  suffix={arg.occurrences > 1 ? `declared ${arg.occurrences} times` : null}
+                />
+              ))
+            )}
+            {validationError ? <Text color="red">{validationError}</Text> : null}
+            {editState ? (
+              <Box flexDirection="column">
+                <Text dimColor>Type to edit. Enter saves. Esc cancels.</Text>
+                <Text dimColor>Left/Right move cursor. Home/End or Ctrl+A/Ctrl+E jump. Ctrl+U clears.</Text>
+              </Box>
+            ) : (
+              <Box flexDirection="column">
+                <Text dimColor>Up/Down or Tab moves. Enter/e edits. Space toggles ARG. b builds.</Text>
+                <Text dimColor>Press q or Esc to quit.</Text>
+              </Box>
+            )}
+          </>
+        ) : (<FieldRow selected={false} label={"Fixed Prefix"} value={""} editing={true} draft={editState?.field.kind === "init" ? editState.draft : null} cursor={editState?.field.kind === "init" ? editState.cursor : null} />)
+      }
+    </Box >
+  )
 }
 
 function FieldRow({
@@ -508,7 +574,7 @@ function FieldRow({
   editing,
   draft,
   cursor,
-  suffix,
+  suffix = "",
 }: {
   selected: boolean;
   label: string;
@@ -520,7 +586,7 @@ function FieldRow({
 }) {
   return (
     <Text color={selected ? "cyan" : undefined}>
-      {selected ? "› " : "  "}{label}: {editing && draft !== null && cursor !== null ? renderDraft(draft, cursor) : value}{suffix ? ` (${suffix})` : ""}
+      {selected ? "› " : "  "}{label}: {editing && draft !== null && cursor !== null ? renderDraft(draft, cursor) : value}{suffix}
     </Text>
   );
 }
@@ -719,6 +785,7 @@ function supportsRawInput(): boolean {
 function parseArgs(argv: string[]): ParsedArgs {
   let contextArg: string | null = null;
   let imageTag: string | null = null;
+  let config: Config = {};
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -731,7 +798,7 @@ function parseArgs(argv: string[]): ParsedArgs {
       const value = argv[index + 1];
 
       if (!value) {
-        return invalidArgs("Missing value for --tag.");
+        return invalidArgs("Missing value for --tag.", config);
       }
 
       imageTag = value;
@@ -745,11 +812,11 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
 
     if (arg.startsWith("-")) {
-      return invalidArgs(`Unknown option: ${arg}`);
+      return invalidArgs(`Unknown option: ${arg}`, config);
     }
 
     if (contextArg) {
-      return invalidArgs(`Unexpected argument: ${arg}`);
+      return invalidArgs(`Unexpected argument: ${arg}`, config);
     }
 
     contextArg = arg;
@@ -758,16 +825,22 @@ function parseArgs(argv: string[]): ParsedArgs {
   const contextDir = resolve(contextArg ?? process.cwd());
   const configPath = join(contextDir, ".nd.json");
 
+  config = readNdConfig(configPath) ?? {};
+
+  if (imageTag) {
+    config.tag = imageTag;
+  }
+
   return {
     contextDir,
     dockerfilePath: join(contextDir, "Dockerfile"),
     configPath,
-    imageTag: imageTag ?? readTag(configPath) ?? defaultTagFor(contextDir),
+    config,
     error: null,
   };
 }
 
-function invalidArgs(error: string): ParsedArgs {
+function invalidArgs(error: string, config: Config): ParsedArgs {
   const contextDir = process.cwd();
   const configPath = join(contextDir, ".nd.json");
 
@@ -775,36 +848,75 @@ function invalidArgs(error: string): ParsedArgs {
     contextDir,
     dockerfilePath: join(contextDir, "Dockerfile"),
     configPath,
-    imageTag: readTag(configPath) ?? defaultTagFor(contextDir),
+    config,
     error,
   };
 }
 
-function readTag(configPath: string): string | null {
+function readNdConfig(configPath: string): Config | null {
   try {
-    const { tag } = JSON.parse(readFileSync(configPath, "utf-8"));
-
-    return tag && typeof tag === "string" ? tag : null;
+    const text = readFileSync(configPath, "utf-8");
+    const json = JSON.parse(text);
+    return json ? json : null;
   } catch {
     return null;
   }
 }
 
-function writeNdConfig(configPath: string, tag: string): void {
-  const next = {
-    tag: tag,
-  };
+// function readNdConfig(configPath: string): NdConfig {
+//   try {
+//     const parsed = JSON.parse(readFileSync(configPath, "utf-8"));
 
-  writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`, "utf-8");
+//     if (!isRecord(parsed)) {
+//       return {};
+//     }
+
+//     return parsed;
+//   } catch {
+//     return {};
+//   }
+// }
+
+// function readTag(configPath: string): string | null {
+//   const { tag } = readNdConfig(configPath);
+
+//   return typeof tag === "string" ? tag : null;
+// }
+
+// function readVersionCheckUrl(configPath: string): string | null {
+//   const { versionCheckUrl } = readNdConfig(configPath);
+//   return versionCheckUrl ? versionCheckUrl : null;
+// }
+
+// function writeNdConfig(configPath: string, tag: string): void {
+//   const next = {
+//     ...readNdConfig(configPath),
+//     tag,
+//   };
+
+//   writeFileSync(configPath, `${JSON.stringify(next, null, 2)}\n`, "utf-8");
+// }
+
+// function isRecord(value: unknown): value is NdConfig {
+//   return typeof value === "object" && value !== null && !Array.isArray(value);
+// }
+
+async function checkLatestVersion(
+  versionCheckUrl: string,
+  signal: AbortSignal,
+): Promise<string | null> {
+  const response = await fetch(versionCheckUrl, { signal });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  return extractNpmLatestVersion(await response.json() as NpmMetadata);
 }
 
-function defaultTagFor(contextDir: string): string {
-  const name = basename(contextDir)
-    .toLowerCase()
-    .replace(/[^a-z0-9_.-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return `${name || "nd-build"}:latest`;
+function extractNpmLatestVersion(metadata: NpmMetadata): string | null {
+  const latest = metadata?.latest;
+  return latest && typeof latest === "string" ? latest : null;
 }
 
 function parseDockerfileArgs(text: string): BuildArgDefinition[] {
