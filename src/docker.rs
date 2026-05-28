@@ -1,8 +1,19 @@
-use std::process::Command;
+use std::{
+    io::{BufRead, BufReader},
+    process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+};
 
 use anyhow::{Context, Result, bail};
 
 use crate::app::{Container, Image};
+
+#[derive(Debug)]
+pub enum BuildEvent {
+    Line(String),
+    Finished { success: bool, message: String },
+}
 
 pub fn list_containers() -> Result<Vec<Container>> {
     let output = run_docker(&[
@@ -57,8 +68,75 @@ pub fn system_prune() -> Result<String> {
     run_docker(&["system", "prune", "-f"])
 }
 
-pub fn build_image(path: &str) -> Result<String> {
-    run_docker(&["build", path])
+pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<BuildEvent>> {
+    let (tx, rx) = mpsc::channel();
+    let mut command = Command::new("nerdctl");
+    command.arg("build");
+
+    if let Some(tag) = tag.as_deref() {
+        command.args(["-t", tag]);
+    }
+
+    let mut child = command
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start nerdctl build")?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    thread::spawn(move || {
+        let mut readers = Vec::new();
+
+        if let Some(stdout) = stdout {
+            readers.push(spawn_reader(stdout, tx.clone()));
+        }
+
+        if let Some(stderr) = stderr {
+            readers.push(spawn_reader(stderr, tx.clone()));
+        }
+
+        let wait_result = child.wait();
+
+        for reader in readers {
+            let _ = reader.join();
+        }
+
+        let event = match wait_result {
+            Ok(status) if status.success() => BuildEvent::Finished {
+                success: true,
+                message: "build completed successfully".to_string(),
+            },
+            Ok(status) => BuildEvent::Finished {
+                success: false,
+                message: format!("build exited with status {status}"),
+            },
+            Err(err) => BuildEvent::Finished {
+                success: false,
+                message: format!("failed to wait for build: {err}"),
+            },
+        };
+
+        let _ = tx.send(event);
+    });
+
+    Ok(rx)
+}
+
+fn spawn_reader<R>(reader: R, tx: Sender<BuildEvent>) -> thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            let _ = tx.send(BuildEvent::Line(line));
+        }
+    })
 }
 
 fn run_docker(args: &[&str]) -> Result<String> {

@@ -1,10 +1,13 @@
-use crate::docker;
+use std::sync::mpsc::Receiver;
+
+use crate::{config, docker};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Containers,
     Images,
     Build,
+    BuildStatus,
     Logs,
 }
 
@@ -14,7 +17,8 @@ impl Screen {
             Self::Containers => 0,
             Self::Images => 1,
             Self::Build => 2,
-            Self::Logs => 3,
+            Self::BuildStatus => 3,
+            Self::Logs => 4,
         }
     }
 
@@ -22,7 +26,8 @@ impl Screen {
         match self {
             Self::Containers => Self::Images,
             Self::Images => Self::Build,
-            Self::Build => Self::Logs,
+            Self::Build => Self::BuildStatus,
+            Self::BuildStatus => Self::Logs,
             Self::Logs => Self::Containers,
         }
     }
@@ -32,7 +37,8 @@ impl Screen {
             Self::Containers => Self::Logs,
             Self::Images => Self::Containers,
             Self::Build => Self::Images,
-            Self::Logs => Self::Build,
+            Self::BuildStatus => Self::Build,
+            Self::Logs => Self::BuildStatus,
         }
     }
 }
@@ -44,7 +50,6 @@ pub enum Modal {
     ConfirmImagePrune,
     ConfirmBuilderPrune,
     ConfirmSystemPrune,
-    BuildImage,
 }
 
 #[derive(Debug, Clone)]
@@ -73,9 +78,22 @@ pub struct App {
     pub images: Vec<Image>,
     pub selected_container: usize,
     pub selected_image: usize,
+    pub selected_build_tag: usize,
     pub status: String,
     pub logs: Vec<String>,
     pub input: String,
+    pub configs: Vec<Config>,
+    pub build_lines: Vec<String>,
+    pub build_running: bool,
+    build_events: Option<Receiver<docker::BuildEvent>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub build_tag_template: Option<String>,
+    pub build_tag: Option<String>,
+    pub latest_version: Option<String>,
+    pub version_url: Option<String>,
 }
 
 impl App {
@@ -88,14 +106,39 @@ impl App {
             images: Vec::new(),
             selected_container: 0,
             selected_image: 0,
+            selected_build_tag: 0,
             status: "ready".to_string(),
             logs: Vec::new(),
             input: String::new(),
+            configs: vec![],
+            build_lines: Vec::new(),
+            build_running: false,
+            build_events: None,
         }
     }
 
     pub fn refresh(&mut self) {
         let mut refreshed = true;
+
+        match config::read_build_config() {
+            Ok(build_config) => {
+                self.configs = build_config
+                    .configs
+                    .into_iter()
+                    .map(|config| Config {
+                        build_tag_template: config.tag_template,
+                        build_tag: config.tag,
+                        latest_version: config.latest_version,
+                        version_url: config.version_url,
+                    })
+                    .collect();
+                self.clamp_build_selection();
+            }
+            Err(err) => {
+                refreshed = false;
+                self.set_error(format!("config: {err}"));
+            }
+        }
 
         match docker::list_containers() {
             Ok(containers) => {
@@ -136,6 +179,9 @@ impl App {
             Screen::Images if !self.images.is_empty() => {
                 self.selected_image = self.selected_image.saturating_sub(1);
             }
+            Screen::Build if !self.configs.is_empty() => {
+                self.selected_build_tag = self.selected_build_tag.saturating_sub(1);
+            }
             _ => {}
         }
     }
@@ -149,6 +195,10 @@ impl App {
             Screen::Images if !self.images.is_empty() => {
                 self.selected_image =
                     (self.selected_image + 1).min(self.images.len().saturating_sub(1));
+            }
+            Screen::Build if !self.configs.is_empty() => {
+                self.selected_build_tag =
+                    (self.selected_build_tag + 1).min(self.configs.len().saturating_sub(1));
             }
             _ => {}
         }
@@ -174,16 +224,16 @@ impl App {
         self.images.get(self.selected_image)
     }
 
+    pub fn selected_config(&self) -> Option<&Config> {
+        self.configs.get(self.selected_build_tag)
+    }
+
     pub fn open_modal(&mut self, modal: Modal) {
         self.modal = Some(modal);
-        if modal == Modal::BuildImage {
-            self.input.clear();
-        }
     }
 
     pub fn close_modal(&mut self) {
         self.modal = None;
-        self.input.clear();
     }
 
     pub fn push_log(&mut self, message: impl Into<String>) {
@@ -205,6 +255,59 @@ impl App {
     pub fn clear_logs(&mut self) {
         self.logs.clear();
         self.status = "logs cleared".to_string();
+    }
+
+    pub fn start_build(&mut self, receiver: Receiver<docker::BuildEvent>) {
+        self.build_lines.clear();
+        self.build_events = Some(receiver);
+        self.build_running = true;
+        self.status = "build started".to_string();
+    }
+
+    pub fn poll_build_events(&mut self) {
+        let mut events = Vec::new();
+
+        if let Some(receiver) = &self.build_events {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                docker::BuildEvent::Line(line) => self.push_build_line(line),
+                docker::BuildEvent::Finished { success, message } => {
+                    self.push_build_line(message.clone());
+                    self.build_running = false;
+                    self.build_events = None;
+                    self.status = if success {
+                        "build completed".to_string()
+                    } else {
+                        "build failed".to_string()
+                    };
+                }
+            }
+        }
+    }
+
+    pub fn clear_build_lines(&mut self) {
+        if !self.build_running {
+            self.build_lines.clear();
+            self.status = "build status cleared".to_string();
+        }
+    }
+
+    fn push_build_line(&mut self, line: String) {
+        if line.trim().is_empty() {
+            return;
+        }
+
+        self.build_lines.push(line);
+
+        if self.build_lines.len() > 2_000 {
+            let remove_count = self.build_lines.len() - 2_000;
+            self.build_lines.drain(0..remove_count);
+        }
     }
 
     pub fn set_status(&mut self, status: impl Into<String>) {
@@ -232,6 +335,16 @@ impl App {
             self.selected_image = 0;
         } else {
             self.selected_image = self.selected_image.min(self.images.len().saturating_sub(1));
+        }
+    }
+
+    fn clamp_build_selection(&mut self) {
+        if self.configs.is_empty() {
+            self.selected_build_tag = 0;
+        } else {
+            self.selected_build_tag = self
+                .selected_build_tag
+                .min(self.configs.len().saturating_sub(1));
         }
     }
 }

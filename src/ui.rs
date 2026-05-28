@@ -8,7 +8,10 @@ use ratatui::{
 
 use crate::{
     app::{App, Modal, Screen},
-    consts::{HELP_BUILD, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL, SIDEBAR_ITEMS},
+    consts::{
+        HELP_BUILD, HELP_BUILD_STATUS, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL,
+        SIDEBAR_ITEMS,
+    },
 };
 
 pub fn ui(frame: &mut Frame, app: &App) {
@@ -64,7 +67,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let items = SIDEBAR_ITEMS
         .iter()
         .enumerate()
-        .map(|(index, &item)| {
+        .map(|(index, item)| {
             let style = if index == app.screen.index() {
                 Style::default()
                     .fg(Color::Black)
@@ -74,7 +77,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            ListItem::new(Line::from(item)).style(style)
+            ListItem::new(Line::from(*item)).style(style)
         })
         .collect::<Vec<_>>();
 
@@ -86,7 +89,8 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
     match app.screen {
         Screen::Containers => render_containers(frame, area, app),
         Screen::Images => render_images(frame, area, app),
-        Screen::Build => reader_build(frame, area, app),
+        Screen::Build => render_build(frame, area, app),
+        Screen::BuildStatus => render_build_status(frame, area, app),
         Screen::Logs => render_logs(frame, area, app),
     }
 }
@@ -187,8 +191,83 @@ fn render_images(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(table, area);
 }
 
-fn reader_build(frame: &mut Frame, area: Rect, app: &App) {
-    
+fn render_build(frame: &mut Frame, area: Rect, app: &App) {
+    let input = if app.input.is_empty() {
+        "<enter build context path>"
+    } else {
+        app.input.as_str()
+    };
+
+    let mut text = vec![
+        Line::from("Build an image with nerdctl from a local context path."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Context path: ", Style::default().fg(Color::Yellow)),
+            Span::styled(input, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from("Configured tags:"),
+    ];
+
+    if app.configs.is_empty() {
+        text.push(Line::from("  <no configs in nd.toml>"));
+    } else {
+        for (index, config) in app.configs.iter().enumerate() {
+            let marker = if index == app.selected_build_tag {
+                ">"
+            } else {
+                " "
+            };
+            let tag = config.build_tag.as_deref().unwrap_or("<no tag resolved>");
+            let version = config.latest_version.as_deref().unwrap_or("<not resolved>");
+            let url = config.version_url.as_deref().unwrap_or("<no version url>");
+            let style = if index == app.selected_build_tag {
+                Style::default().fg(Color::Black).bg(Color::LightYellow)
+            } else {
+                Style::default()
+            };
+
+            text.push(Line::styled(
+                format!("{marker} {tag} | latest: {version} | {url}"),
+                style,
+            ));
+        }
+    }
+
+    text.extend([
+        Line::from(""),
+        Line::from("Use ↑/↓ to select a configured tag."),
+        Line::from("Press Enter to run `nerdctl build -t <selected-tag> <path>`."),
+        Line::from("Press r to reload nd.toml and re-resolve versions."),
+        Line::from("Press p to prune the builder cache after confirmation."),
+    ]);
+
+    let widget = Paragraph::new(text)
+        .block(Block::default().title("Build").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(widget, area);
+}
+
+fn render_build_status(frame: &mut Frame, area: Rect, app: &App) {
+    let height = area.height.saturating_sub(2) as usize;
+    let start = app.build_lines.len().saturating_sub(height);
+    let text = if app.build_lines.is_empty() {
+        "No build output yet. Start a build from the Build page.".to_string()
+    } else {
+        app.build_lines[start..].join("\n")
+    };
+    let title = if app.build_running {
+        "Build Status (running)"
+    } else {
+        "Build Status"
+    };
+
+    let status = Paragraph::new(text)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(status, area);
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
@@ -232,8 +311,30 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 )
             })
             .unwrap_or_else(|| "No image selected.".to_string()),
-        // TODO: implement build
-        Screen::Build => String::new(),
+        Screen::Build => app
+            .selected_config()
+            .map(|config| {
+                format!(
+                    "Build context path\n{}\n\nTag template\n{}\n\nLatest version\n{}\n\nResolved tag\n{}",
+                    if app.input.is_empty() {
+                        "No path entered."
+                    } else {
+                        app.input.as_str()
+                    },
+                    config
+                        .build_tag_template
+                        .as_deref()
+                        .unwrap_or("No tag template."),
+                    config.latest_version.as_deref().unwrap_or("Not resolved."),
+                    config.build_tag.as_deref().unwrap_or("No tag resolved.")
+                )
+            })
+            .unwrap_or_else(|| "No build config selected.".to_string()),
+        Screen::BuildStatus => format!(
+            "Build status\n{}\n\n{} output lines",
+            if app.build_running { "Running" } else { "Idle" },
+            app.build_lines.len()
+        ),
         Screen::Logs => format!("{} log lines", app.logs.len()),
     };
 
@@ -241,6 +342,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Containers => HELP_CONTAINERS,
         Screen::Images => HELP_IMAGES,
         Screen::Build => HELP_BUILD,
+        Screen::BuildStatus => HELP_BUILD_STATUS,
         Screen::Logs => HELP_LOGS,
     };
 
@@ -290,17 +392,12 @@ fn render_modal(frame: &mut Frame, app: &App) {
         Modal::ConfirmBuilderPrune => (
             "Prune builder",
             "Remove builder cache?".to_string(),
-            HELP_BUILD,
+            HELP_MODAL,
         ),
         Modal::ConfirmSystemPrune => (
             "System prune",
             "Remove unused Docker data?".to_string(),
             HELP_MODAL,
-        ),
-        Modal::BuildImage => (
-            "Build image",
-            format!("Docker build context path:\n> {}", app.input),
-            HELP_BUILD,
         ),
     };
 

@@ -1,13 +1,16 @@
 pub(crate) mod app;
+pub(crate) mod config;
 pub(crate) mod consts;
 pub(crate) mod docker;
 pub(crate) mod ui;
+
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
     event::{
         DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, poll,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -56,9 +59,12 @@ where
     app.refresh();
 
     while !app.should_quit {
+        app.poll_build_events();
         terminal.draw(|frame| ui(frame, app))?;
 
-        if let Event::Key(key) = crossterm::event::read()? {
+        if poll(Duration::from_millis(100))?
+            && let Event::Key(key) = crossterm::event::read()?
+        {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
@@ -89,7 +95,9 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::BackTab => app.previous_screen(),
         KeyCode::Char('1') => app.set_screen(Screen::Containers),
         KeyCode::Char('2') => app.set_screen(Screen::Images),
-        KeyCode::Char('3') => app.set_screen(Screen::Logs),
+        KeyCode::Char('3') => app.set_screen(Screen::Build),
+        KeyCode::Char('4') => app.set_screen(Screen::BuildStatus),
+        KeyCode::Char('5') => app.set_screen(Screen::Logs),
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Char('s') if app.screen == Screen::Containers => {
@@ -116,8 +124,23 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') if app.screen == Screen::Build => {
             app.open_modal(Modal::ConfirmBuilderPrune)
         }
-        KeyCode::Char('b') if app.screen == Screen::Images => app.open_modal(Modal::BuildImage),
+        KeyCode::Enter if app.screen == Screen::Build => run_build(app),
+        KeyCode::Backspace if app.screen == Screen::Build => {
+            app.input.pop();
+        }
+        KeyCode::Char('u')
+            if app.screen == Screen::Build && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.input.clear();
+            app.set_status("build path cleared");
+        }
+        KeyCode::Char('c') if app.screen == Screen::BuildStatus => app.clear_build_lines(),
         KeyCode::Char('c') if app.screen == Screen::Logs => app.clear_logs(),
+        KeyCode::Char(character) if app.screen == Screen::Build => {
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+                app.input.push(character);
+            }
+        }
         _ => {}
     }
 }
@@ -128,7 +151,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     };
 
     match modal {
-        Modal::BuildImage => handle_build_modal_key(app, key),
         Modal::ConfirmRemoveContainer
         | Modal::ConfirmRemoveImage
         | Modal::ConfirmImagePrune
@@ -153,7 +175,6 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
                     run_action(app, "builder pruned", docker::prune_builder)
                 }
                 Modal::ConfirmSystemPrune => run_action(app, "system pruned", docker::system_prune),
-                Modal::BuildImage => {}
             }
         }
         KeyCode::Char('n') | KeyCode::Esc => app.close_modal(),
@@ -161,28 +182,29 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
     }
 }
 
-fn handle_build_modal_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Enter => {
-            let path = app.input.trim().to_string();
-            app.close_modal();
+fn run_build(app: &mut App) {
+    let path = app.input.trim().to_string();
 
-            if path.is_empty() {
-                app.set_error("build path is required");
-            } else {
-                run_action(app, "image build completed", || docker::build_image(&path));
-            }
+    if path.is_empty() {
+        app.set_error("build path is required");
+        return;
+    }
+
+    if app.build_running {
+        app.set_error("a build is already running");
+        return;
+    }
+
+    let tag = app
+        .selected_config()
+        .and_then(|config| config.build_tag.clone());
+
+    match docker::build_image_stream(path, tag) {
+        Ok(receiver) => {
+            app.start_build(receiver);
+            app.set_screen(Screen::BuildStatus);
         }
-        KeyCode::Backspace => {
-            app.input.pop();
-        }
-        KeyCode::Esc => app.close_modal(),
-        KeyCode::Char(character) => {
-            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                app.input.push(character);
-            }
-        }
-        _ => {}
+        Err(err) => app.set_error(err),
     }
 }
 
