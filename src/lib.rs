@@ -240,13 +240,22 @@ fn with_selected_container(
     run_action(app, format!("container {success_status}"), || action(&id));
 }
 
-fn with_selected_image(app: &mut App, success_status: &str, action: fn(&str) -> Result<String>) {
-    let Some(id) = app.selected_image().map(|image| image.id.clone()) else {
+fn with_selected_image(
+    app: &mut App,
+    success_status: &str,
+    action: fn(&str, Option<&str>) -> Result<String>,
+) {
+    let Some((repo, tag)) = app
+        .selected_image()
+        .map(|image| (image.repository.clone(), image.tag.clone()))
+    else {
         app.set_error("no image selected");
         return;
     };
 
-    run_action(app, format!("image {success_status}"), || action(&id));
+    run_action(app, format!("image {success_status}"), || {
+        action(&repo, Some(&tag))
+    });
 }
 
 fn run_action<F>(app: &mut App, success_status: impl Into<String>, action: F)
