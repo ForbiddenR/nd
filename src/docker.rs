@@ -52,6 +52,13 @@ pub fn remove_container(id: &str) -> Result<String> {
     run_docker(&["rm", id])
 }
 
+pub fn push_image(repository: &str, tag: Option<&str>) -> Result<String> {
+    run_docker(&[
+        "push",
+        &format!("{}:{}", repository, tag.unwrap_or("latest")),
+    ])
+}
+
 pub fn remove_image(repository: &str, tag: Option<&str>) -> Result<String> {
     run_docker(&[
         "rmi",

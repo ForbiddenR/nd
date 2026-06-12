@@ -50,6 +50,7 @@ pub enum Modal {
     ConfirmImagePrune,
     ConfirmBuilderPrune,
     ConfirmSystemPrune,
+    ConfirmPushIage,
 }
 
 #[derive(Debug, Clone)]

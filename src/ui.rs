@@ -377,6 +377,13 @@ fn render_modal(frame: &mut Frame, app: &App) {
                 .unwrap_or_else(|| "selected container".to_string());
             ("Remove container", format!("Remove {target}?"), HELP_MODAL)
         }
+        Modal::ConfirmPushIage => {
+            let target = app
+                .selected_image()
+                .map(|image| format!("{}:{} ({})", image.repository, image.tag, image.id))
+                .unwrap_or_else(|| "selected image".to_string());
+            ("Push image", format!("Push {target} to registry?"), HELP_MODAL)
+        }
         Modal::ConfirmRemoveImage => {
             let target = app
                 .selected_image()

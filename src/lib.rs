@@ -121,6 +121,9 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') if app.screen == Screen::Images => {
             app.open_modal(Modal::ConfirmImagePrune)
         }
+        KeyCode::Char('s') if app.screen == Screen::Images => {
+            app.open_modal(Modal::ConfirmPushIage);
+        }
         KeyCode::Char('p') if app.screen == Screen::Build => {
             app.open_modal(Modal::ConfirmBuilderPrune)
         }
@@ -152,6 +155,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
 
     match modal {
         Modal::ConfirmRemoveContainer
+        | Modal::ConfirmPushIage
         | Modal::ConfirmRemoveImage
         | Modal::ConfirmImagePrune
         | Modal::ConfirmBuilderPrune
@@ -166,6 +170,9 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
             match modal {
                 Modal::ConfirmRemoveContainer => {
                     with_selected_container(app, "removed", docker::remove_container)
+                }
+                Modal::ConfirmPushIage => {
+                    with_selected_image(app, "pushed", docker::push_image);
                 }
                 Modal::ConfirmRemoveImage => {
                     with_selected_image(app, "removed", docker::remove_image)
