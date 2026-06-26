@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader},
+    io::Read,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -50,13 +50,6 @@ pub fn restart_container(id: &str) -> Result<String> {
 
 pub fn remove_container(id: &str) -> Result<String> {
     run_docker(&["rm", id])
-}
-
-pub fn push_image(repository: &str, tag: Option<&str>) -> Result<String> {
-    run_docker(&[
-        "push",
-        &format!("{}:{}", repository, tag.unwrap_or("latest")),
-    ])
 }
 
 pub fn push_image_stream(repository: String, tag: String) -> Result<Receiver<ProgressEvent>> {
@@ -111,12 +104,13 @@ pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<
 
 fn spawn_docker_stream(
     mut command: Command,
-    start_context: &str,
-    success_message: &str,
-    action_name: &str,
+    start_context: &'static str,
+    success_message: &'static str,
+    action_name: &'static str,
 ) -> Result<Receiver<ProgressEvent>> {
     let (tx, rx) = mpsc::channel();
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -167,14 +161,41 @@ fn spawn_docker_stream(
 
 fn spawn_reader<R>(reader: R, tx: Sender<ProgressEvent>) -> thread::JoinHandle<()>
 where
-    R: std::io::Read + Send + 'static,
+    R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        for line in BufReader::new(reader)
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
-            let _ = tx.send(ProgressEvent::Line(line));
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        let mut pending = String::new();
+
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => pending.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(_) => break,
+            }
+
+            // nerdctl push/build emit progress with '\r' updates, not just '\n',
+            // so split on either to stream output live instead of buffering until the end.
+            while let Some(pos) = pending.find(|c: char| c == '\n' || c == '\r') {
+                let delim = pending[pos..].chars().next().unwrap();
+                let delim_len = delim.len_utf8();
+                let line: String = pending.drain(..pos).collect();
+                pending.drain(..delim_len);
+
+                // consume the '\n' of a '\r\n' pair so it isn't emitted as a blank line
+                if delim == '\r' && pending.starts_with('\n') {
+                    pending.drain(..1);
+                }
+
+                if !line.trim().is_empty() {
+                    let _ = tx.send(ProgressEvent::Line(line));
+                }
+            }
+        }
+
+        if !pending.trim().is_empty() {
+            let _ = tx.send(ProgressEvent::Line(pending));
         }
     })
 }
