@@ -60,6 +60,7 @@ where
 
     while !app.should_quit {
         app.poll_build_events();
+        app.poll_push_events();
         terminal.draw(|frame| ui(frame, app))?;
 
         if poll(Duration::from_millis(100))?
@@ -97,7 +98,8 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('2') => app.set_screen(Screen::Images),
         KeyCode::Char('3') => app.set_screen(Screen::Build),
         KeyCode::Char('4') => app.set_screen(Screen::BuildStatus),
-        KeyCode::Char('5') => app.set_screen(Screen::Logs),
+        KeyCode::Char('5') => app.set_screen(Screen::PushStatus),
+        KeyCode::Char('6') => app.set_screen(Screen::Logs),
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Char('s') if app.screen == Screen::Containers => {
@@ -122,7 +124,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             app.open_modal(Modal::ConfirmImagePrune)
         }
         KeyCode::Char('s') if app.screen == Screen::Images => {
-            app.open_modal(Modal::ConfirmPushIage);
+            app.open_modal(Modal::ConfirmPushImage);
         }
         KeyCode::Char('p') if app.screen == Screen::Build => {
             app.open_modal(Modal::ConfirmBuilderPrune)
@@ -138,6 +140,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             app.set_status("build path cleared");
         }
         KeyCode::Char('c') if app.screen == Screen::BuildStatus => app.clear_build_lines(),
+        KeyCode::Char('c') if app.screen == Screen::PushStatus => app.clear_push_lines(),
         KeyCode::Char('c') if app.screen == Screen::Logs => app.clear_logs(),
         KeyCode::Char(character) if app.screen == Screen::Build => {
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
@@ -155,7 +158,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
 
     match modal {
         Modal::ConfirmRemoveContainer
-        | Modal::ConfirmPushIage
+        | Modal::ConfirmPushImage
         | Modal::ConfirmRemoveImage
         | Modal::ConfirmImagePrune
         | Modal::ConfirmBuilderPrune
@@ -171,9 +174,7 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
                 Modal::ConfirmRemoveContainer => {
                     with_selected_container(app, "removed", docker::remove_container)
                 }
-                Modal::ConfirmPushIage => {
-                    with_selected_image(app, "pushed", docker::push_image);
-                }
+                Modal::ConfirmPushImage => run_push(app),
                 Modal::ConfirmRemoveImage => {
                     with_selected_image(app, "removed", docker::remove_image)
                 }
@@ -210,6 +211,29 @@ fn run_build(app: &mut App) {
         Ok(receiver) => {
             app.start_build(receiver);
             app.set_screen(Screen::BuildStatus);
+        }
+        Err(err) => app.set_error(err),
+    }
+}
+
+fn run_push(app: &mut App) {
+    if app.push_running {
+        app.set_error("a push is already running");
+        return;
+    }
+
+    let Some((repo, tag)) = app
+        .selected_image()
+        .map(|image| (image.repository.clone(), image.tag.clone()))
+    else {
+        app.set_error("no image selected");
+        return;
+    };
+
+    match docker::push_image_stream(repo, tag) {
+        Ok(receiver) => {
+            app.start_push(receiver);
+            app.set_screen(Screen::PushStatus);
         }
         Err(err) => app.set_error(err),
     }

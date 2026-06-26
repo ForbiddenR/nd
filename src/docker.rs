@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use crate::app::{Container, Image};
 
 #[derive(Debug)]
-pub enum BuildEvent {
+pub enum ProgressEvent {
     Line(String),
     Finished { success: bool, message: String },
 }
@@ -59,6 +59,19 @@ pub fn push_image(repository: &str, tag: Option<&str>) -> Result<String> {
     ])
 }
 
+pub fn push_image_stream(repository: String, tag: String) -> Result<Receiver<ProgressEvent>> {
+    let image = format!("{repository}:{tag}");
+    let mut command = Command::new("nerdctl");
+    command.args(["push", image.as_str()]);
+
+    spawn_docker_stream(
+        command,
+        "failed to start nerdctl push",
+        "push completed successfully",
+        "push",
+    )
+}
+
 pub fn remove_image(repository: &str, tag: Option<&str>) -> Result<String> {
     run_docker(&[
         "rmi",
@@ -78,8 +91,7 @@ pub fn system_prune() -> Result<String> {
     run_docker(&["system", "prune", "-f"])
 }
 
-pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<BuildEvent>> {
-    let (tx, rx) = mpsc::channel();
+pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<ProgressEvent>> {
     let mut command = Command::new("nerdctl");
     command.arg("build");
 
@@ -87,15 +99,33 @@ pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<
         command.args(["-t", tag]);
     }
 
+    command.arg(path);
+
+    spawn_docker_stream(
+        command,
+        "failed to start nerdctl build",
+        "build completed successfully",
+        "build",
+    )
+}
+
+fn spawn_docker_stream(
+    mut command: Command,
+    start_context: &str,
+    success_message: &str,
+    action_name: &str,
+) -> Result<Receiver<ProgressEvent>> {
+    let (tx, rx) = mpsc::channel();
     let mut child = command
-        .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to start nerdctl build")?;
+        .context(start_context)?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let success_message = success_message.to_string();
+    let action_name = action_name.to_string();
 
     thread::spawn(move || {
         let mut readers = Vec::new();
@@ -115,17 +145,17 @@ pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<
         }
 
         let event = match wait_result {
-            Ok(status) if status.success() => BuildEvent::Finished {
+            Ok(status) if status.success() => ProgressEvent::Finished {
                 success: true,
-                message: "build completed successfully".to_string(),
+                message: success_message,
             },
-            Ok(status) => BuildEvent::Finished {
+            Ok(status) => ProgressEvent::Finished {
                 success: false,
-                message: format!("build exited with status {status}"),
+                message: format!("{action_name} exited with status {status}"),
             },
-            Err(err) => BuildEvent::Finished {
+            Err(err) => ProgressEvent::Finished {
                 success: false,
-                message: format!("failed to wait for build: {err}"),
+                message: format!("failed to wait for {action_name}: {err}"),
             },
         };
 
@@ -135,7 +165,7 @@ pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<
     Ok(rx)
 }
 
-fn spawn_reader<R>(reader: R, tx: Sender<BuildEvent>) -> thread::JoinHandle<()>
+fn spawn_reader<R>(reader: R, tx: Sender<ProgressEvent>) -> thread::JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
 {
@@ -144,7 +174,7 @@ where
             .lines()
             .map_while(std::result::Result::ok)
         {
-            let _ = tx.send(BuildEvent::Line(line));
+            let _ = tx.send(ProgressEvent::Line(line));
         }
     })
 }

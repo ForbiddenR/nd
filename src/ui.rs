@@ -10,10 +10,9 @@ use crate::{
     app::{App, Modal, Screen},
     consts::{
         HELP_BUILD, HELP_BUILD_STATUS, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL,
-        SIDEBAR_ITEMS,
+        HELP_PUSH_STATUS, SIDEBAR_ITEMS,
     },
 };
-
 pub fn ui(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -91,6 +90,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Images => render_images(frame, area, app),
         Screen::Build => render_build(frame, area, app),
         Screen::BuildStatus => render_build_status(frame, area, app),
+        Screen::PushStatus => render_push_status(frame, area, app),
         Screen::Logs => render_logs(frame, area, app),
     }
 }
@@ -270,6 +270,27 @@ fn render_build_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(status, area);
 }
 
+fn render_push_status(frame: &mut Frame, area: Rect, app: &App) {
+    let height = area.height.saturating_sub(2) as usize;
+    let start = app.push_lines.len().saturating_sub(height);
+    let text = if app.push_lines.is_empty() {
+        "No push output yet. Start a push from the Images page.".to_string()
+    } else {
+        app.push_lines[start..].join("\n")
+    };
+    let title = if app.push_running {
+        "Push Status (running)"
+    } else {
+        "Push Status"
+    };
+
+    let status = Paragraph::new(text)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(status, area);
+}
+
 fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
     let height = area.height.saturating_sub(2) as usize;
     let start = app.logs.len().saturating_sub(height);
@@ -335,6 +356,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             if app.build_running { "Running" } else { "Idle" },
             app.build_lines.len()
         ),
+        Screen::PushStatus => format!(
+            "Push status\n{}\n\n{} output lines",
+            if app.push_running { "Running" } else { "Idle" },
+            app.push_lines.len()
+        ),
         Screen::Logs => format!("{} log lines", app.logs.len()),
     };
 
@@ -343,6 +369,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Images => HELP_IMAGES,
         Screen::Build => HELP_BUILD,
         Screen::BuildStatus => HELP_BUILD_STATUS,
+        Screen::PushStatus => HELP_PUSH_STATUS,
         Screen::Logs => HELP_LOGS,
     };
 
@@ -377,7 +404,7 @@ fn render_modal(frame: &mut Frame, app: &App) {
                 .unwrap_or_else(|| "selected container".to_string());
             ("Remove container", format!("Remove {target}?"), HELP_MODAL)
         }
-        Modal::ConfirmPushIage => {
+        Modal::ConfirmPushImage => {
             let target = app
                 .selected_image()
                 .map(|image| format!("{}:{} ({})", image.repository, image.tag, image.id))

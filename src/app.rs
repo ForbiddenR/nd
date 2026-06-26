@@ -8,6 +8,7 @@ pub enum Screen {
     Images,
     Build,
     BuildStatus,
+    PushStatus,
     Logs,
 }
 
@@ -18,7 +19,8 @@ impl Screen {
             Self::Images => 1,
             Self::Build => 2,
             Self::BuildStatus => 3,
-            Self::Logs => 4,
+            Self::PushStatus => 4,
+            Self::Logs => 5,
         }
     }
 
@@ -27,7 +29,8 @@ impl Screen {
             Self::Containers => Self::Images,
             Self::Images => Self::Build,
             Self::Build => Self::BuildStatus,
-            Self::BuildStatus => Self::Logs,
+            Self::BuildStatus => Self::PushStatus,
+            Self::PushStatus => Self::Logs,
             Self::Logs => Self::Containers,
         }
     }
@@ -38,7 +41,8 @@ impl Screen {
             Self::Images => Self::Containers,
             Self::Build => Self::Images,
             Self::BuildStatus => Self::Build,
-            Self::Logs => Self::BuildStatus,
+            Self::PushStatus => Self::BuildStatus,
+            Self::Logs => Self::PushStatus,
         }
     }
 }
@@ -50,7 +54,7 @@ pub enum Modal {
     ConfirmImagePrune,
     ConfirmBuilderPrune,
     ConfirmSystemPrune,
-    ConfirmPushIage,
+    ConfirmPushImage,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +90,10 @@ pub struct App {
     pub configs: Vec<Config>,
     pub build_lines: Vec<String>,
     pub build_running: bool,
-    build_events: Option<Receiver<docker::BuildEvent>>,
+    build_events: Option<Receiver<docker::ProgressEvent>>,
+    pub push_lines: Vec<String>,
+    pub push_running: bool,
+    push_events: Option<Receiver<docker::ProgressEvent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +122,9 @@ impl App {
             build_lines: Vec::new(),
             build_running: false,
             build_events: None,
+            push_lines: Vec::new(),
+            push_running: false,
+            push_events: None,
         }
     }
 
@@ -258,7 +268,7 @@ impl App {
         self.status = "logs cleared".to_string();
     }
 
-    pub fn start_build(&mut self, receiver: Receiver<docker::BuildEvent>) {
+    pub fn start_build(&mut self, receiver: Receiver<docker::ProgressEvent>) {
         self.build_lines.clear();
         self.build_events = Some(receiver);
         self.build_running = true;
@@ -276,8 +286,8 @@ impl App {
 
         for event in events {
             match event {
-                docker::BuildEvent::Line(line) => self.push_build_line(line),
-                docker::BuildEvent::Finished { success, message } => {
+                docker::ProgressEvent::Line(line) => self.push_build_line(line),
+                docker::ProgressEvent::Finished { success, message } => {
                     self.push_build_line(message.clone());
                     self.build_running = false;
                     self.build_events = None;
@@ -298,16 +308,64 @@ impl App {
         }
     }
 
+    pub fn start_push(&mut self, receiver: Receiver<docker::ProgressEvent>) {
+        self.push_lines.clear();
+        self.push_events = Some(receiver);
+        self.push_running = true;
+        self.status = "push started".to_string();
+    }
+
+    pub fn poll_push_events(&mut self) {
+        let mut events = Vec::new();
+
+        if let Some(receiver) = &self.push_events {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                docker::ProgressEvent::Line(line) => self.push_push_line(line),
+                docker::ProgressEvent::Finished { success, message } => {
+                    self.push_push_line(message.clone());
+                    self.push_running = false;
+                    self.push_events = None;
+                    self.status = if success {
+                        "push completed".to_string()
+                    } else {
+                        "push failed".to_string()
+                    };
+                }
+            }
+        }
+    }
+
+    pub fn clear_push_lines(&mut self) {
+        if !self.push_running {
+            self.push_lines.clear();
+            self.status = "push status cleared".to_string();
+        }
+    }
+
     fn push_build_line(&mut self, line: String) {
+        Self::push_progress_line(&mut self.build_lines, line);
+    }
+
+    fn push_push_line(&mut self, line: String) {
+        Self::push_progress_line(&mut self.push_lines, line);
+    }
+
+    fn push_progress_line(lines: &mut Vec<String>, line: String) {
         if line.trim().is_empty() {
             return;
         }
 
-        self.build_lines.push(line);
+        lines.push(line);
 
-        if self.build_lines.len() > 2_000 {
-            let remove_count = self.build_lines.len() - 2_000;
-            self.build_lines.drain(0..remove_count);
+        if lines.len() > 2_000 {
+            let remove_count = lines.len() - 2_000;
+            lines.drain(0..remove_count);
         }
     }
 
