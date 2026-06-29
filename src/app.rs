@@ -291,11 +291,11 @@ impl App {
                     self.push_build_line(message.clone());
                     self.build_running = false;
                     self.build_events = None;
-                    self.status = if success {
-                        "build completed".to_string()
+                    if success {
+                        self.status = "build completed".to_string();
                     } else {
-                        "build failed".to_string()
-                    };
+                        self.set_error(message);
+                    }
                 }
             }
         }
@@ -331,11 +331,11 @@ impl App {
                     self.push_push_line(message.clone());
                     self.push_running = false;
                     self.push_events = None;
-                    self.status = if success {
-                        "push completed".to_string()
+                    if success {
+                        self.status = "push completed".to_string();
                     } else {
-                        "push failed".to_string()
-                    };
+                        self.set_error(message);
+                    }
                 }
             }
         }
