@@ -293,6 +293,7 @@ impl App {
                     self.build_events = None;
                     if success {
                         self.status = "build completed".to_string();
+                        self.refresh();
                     } else {
                         self.set_error(message);
                     }
@@ -333,6 +334,7 @@ impl App {
                     self.push_events = None;
                     if success {
                         self.status = "push completed".to_string();
+                        self.refresh();
                     } else {
                         self.set_error(message);
                     }
