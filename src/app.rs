@@ -74,6 +74,74 @@ pub struct Image {
     pub size: String,
 }
 
+/// Shared state for a streaming nerdctl operation (build, push, etc.).
+/// Owns the output lines, running flag, and event receiver so the caller
+/// doesn't need to duplicate this triple for each operation.
+#[derive(Debug)]
+pub struct ProgressState {
+    pub lines: Vec<String>,
+    pub running: bool,
+    events: Option<Receiver<docker::ProgressEvent>>,
+}
+
+impl ProgressState {
+    pub fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            running: false,
+            events: None,
+        }
+    }
+
+    pub fn start(&mut self, receiver: Receiver<docker::ProgressEvent>) {
+        self.lines.clear();
+        self.events = Some(receiver);
+        self.running = true;
+    }
+
+    /// Drain all buffered events without blocking.
+    pub fn drain_events(&mut self) -> Vec<docker::ProgressEvent> {
+        let mut events = Vec::new();
+        if let Some(receiver) = &self.events {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Called when a Finished event arrives. Clears the running flag and
+    /// drops the receiver.
+    pub fn handle_finished(&mut self) {
+        self.running = false;
+        self.events = None;
+    }
+
+    /// Clear output lines if not running. Returns true if cleared.
+    pub fn clear_lines(&mut self) -> bool {
+        if self.running {
+            return false;
+        }
+        self.lines.clear();
+        true
+    }
+
+    /// Append a line with a bounded cap. Public so the poll helpers on App
+    /// can call it directly.
+    pub fn push_line(lines: &mut Vec<String>, line: String) {
+        if line.trim().is_empty() {
+            return;
+        }
+
+        lines.push(line);
+
+        if lines.len() > 2_000 {
+            let remove_count = lines.len() - 2_000;
+            lines.drain(0..remove_count);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub should_quit: bool,
@@ -88,12 +156,8 @@ pub struct App {
     pub logs: Vec<String>,
     pub input: String,
     pub configs: Vec<Config>,
-    pub build_lines: Vec<String>,
-    pub build_running: bool,
-    build_events: Option<Receiver<docker::ProgressEvent>>,
-    pub push_lines: Vec<String>,
-    pub push_running: bool,
-    push_events: Option<Receiver<docker::ProgressEvent>>,
+    pub build_state: ProgressState,
+    pub push_state: ProgressState,
 }
 
 #[derive(Debug, Clone)]
@@ -119,12 +183,8 @@ impl App {
             logs: Vec::new(),
             input: String::new(),
             configs: vec![],
-            build_lines: Vec::new(),
-            build_running: false,
-            build_events: None,
-            push_lines: Vec::new(),
-            push_running: false,
-            push_events: None,
+            build_state: ProgressState::new(),
+            push_state: ProgressState::new(),
         }
     }
 
@@ -269,28 +329,19 @@ impl App {
     }
 
     pub fn start_build(&mut self, receiver: Receiver<docker::ProgressEvent>) {
-        self.build_lines.clear();
-        self.build_events = Some(receiver);
-        self.build_running = true;
+        self.build_state.start(receiver);
         self.status = "build started".to_string();
     }
 
     pub fn poll_build_events(&mut self) {
-        let mut events = Vec::new();
-
-        if let Some(receiver) = &self.build_events {
-            while let Ok(event) = receiver.try_recv() {
-                events.push(event);
-            }
-        }
-
-        for event in events {
+        for event in self.build_state.drain_events() {
             match event {
-                docker::ProgressEvent::Line(line) => self.push_build_line(line),
+                docker::ProgressEvent::Line(line) => {
+                    ProgressState::push_line(&mut self.build_state.lines, line);
+                }
                 docker::ProgressEvent::Finished { success, message } => {
-                    self.push_build_line(message.clone());
-                    self.build_running = false;
-                    self.build_events = None;
+                    ProgressState::push_line(&mut self.build_state.lines, message.clone());
+                    self.build_state.handle_finished();
                     if success {
                         self.status = "build completed".to_string();
                         self.refresh();
@@ -303,35 +354,25 @@ impl App {
     }
 
     pub fn clear_build_lines(&mut self) {
-        if !self.build_running {
-            self.build_lines.clear();
+        if self.build_state.clear_lines() {
             self.status = "build status cleared".to_string();
         }
     }
 
     pub fn start_push(&mut self, receiver: Receiver<docker::ProgressEvent>) {
-        self.push_lines.clear();
-        self.push_events = Some(receiver);
-        self.push_running = true;
+        self.push_state.start(receiver);
         self.status = "push started".to_string();
     }
 
     pub fn poll_push_events(&mut self) {
-        let mut events = Vec::new();
-
-        if let Some(receiver) = &self.push_events {
-            while let Ok(event) = receiver.try_recv() {
-                events.push(event);
-            }
-        }
-
-        for event in events {
+        for event in self.push_state.drain_events() {
             match event {
-                docker::ProgressEvent::Line(line) => self.push_push_line(line),
+                docker::ProgressEvent::Line(line) => {
+                    ProgressState::push_line(&mut self.push_state.lines, line);
+                }
                 docker::ProgressEvent::Finished { success, message } => {
-                    self.push_push_line(message.clone());
-                    self.push_running = false;
-                    self.push_events = None;
+                    ProgressState::push_line(&mut self.push_state.lines, message.clone());
+                    self.push_state.handle_finished();
                     if success {
                         self.status = "push completed".to_string();
                         self.refresh();
@@ -344,30 +385,8 @@ impl App {
     }
 
     pub fn clear_push_lines(&mut self) {
-        if !self.push_running {
-            self.push_lines.clear();
+        if self.push_state.clear_lines() {
             self.status = "push status cleared".to_string();
-        }
-    }
-
-    fn push_build_line(&mut self, line: String) {
-        Self::push_progress_line(&mut self.build_lines, line);
-    }
-
-    fn push_push_line(&mut self, line: String) {
-        Self::push_progress_line(&mut self.push_lines, line);
-    }
-
-    fn push_progress_line(lines: &mut Vec<String>, line: String) {
-        if line.trim().is_empty() {
-            return;
-        }
-
-        lines.push(line);
-
-        if lines.len() > 2_000 {
-            let remove_count = lines.len() - 2_000;
-            lines.drain(0..remove_count);
         }
     }
 
