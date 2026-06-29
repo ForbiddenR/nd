@@ -166,36 +166,42 @@ where
     thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 4096];
-        let mut pending = String::new();
+        // Accumulate raw bytes so a multi-byte UTF-8 character split across two
+        // reads is decoded at a line boundary rather than per-chunk (which would
+        // turn it into U+FFFD replacement characters).
+        let mut pending: Vec<u8> = Vec::new();
 
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => pending.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(n) => pending.extend_from_slice(&buf[..n]),
                 Err(_) => break,
             }
 
             // nerdctl push/build emit progress with '\r' updates, not just '\n',
             // so split on either to stream output live instead of buffering until the end.
-            while let Some(pos) = pending.find(|c: char| c == '\n' || c == '\r') {
-                let delim = pending[pos..].chars().next().unwrap();
-                let delim_len = delim.len_utf8();
-                let line: String = pending.drain(..pos).collect();
-                pending.drain(..delim_len);
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n' || b == b'\r') {
+                let delim = pending[pos];
+                let line: Vec<u8> = pending.drain(..pos).collect();
+                pending.drain(..1);
 
                 // consume the '\n' of a '\r\n' pair so it isn't emitted as a blank line
-                if delim == '\r' && pending.starts_with('\n') {
+                if delim == b'\r' && pending.first() == Some(&b'\n') {
                     pending.drain(..1);
                 }
 
+                let line = String::from_utf8_lossy(&line).into_owned();
                 if !line.trim().is_empty() {
                     let _ = tx.send(ProgressEvent::Line(line));
                 }
             }
         }
 
-        if !pending.trim().is_empty() {
-            let _ = tx.send(ProgressEvent::Line(pending));
+        if !pending.is_empty() {
+            let line = String::from_utf8_lossy(&pending).into_owned();
+            if !line.trim().is_empty() {
+                let _ = tx.send(ProgressEvent::Line(line));
+            }
         }
     })
 }
