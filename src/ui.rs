@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 
@@ -89,8 +89,20 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Containers => render_containers(frame, area, app),
         Screen::Images => render_images(frame, area, app),
         Screen::Build => render_build(frame, area, app),
-        Screen::BuildStatus => render_build_status(frame, area, app),
-        Screen::PushStatus => render_push_status(frame, area, app),
+        Screen::BuildStatus => render_progress_status(
+            frame,
+            area,
+            &app.build_state,
+            "Build Status",
+            "No build output yet. Start a build from the Build page.",
+        ),
+        Screen::PushStatus => render_progress_status(
+            frame,
+            area,
+            &app.push_state,
+            "Push Status",
+            "No push output yet. Start a push from the Images page.",
+        ),
         Screen::Logs => render_logs(frame, area, app),
     }
 }
@@ -249,39 +261,33 @@ fn render_build(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
-fn render_build_status(frame: &mut Frame, area: Rect, app: &App) {
+fn render_progress_status(
+    frame: &mut Frame,
+    area: Rect,
+    state: &crate::app::ProgressState,
+    title: &str,
+    empty_message: &str,
+) {
+    // Show only the lines that fit in the visible area, tailing the newest.
     let height = area.height.saturating_sub(2) as usize;
-    let start = app.build_lines.len().saturating_sub(height);
-    let text = if app.build_lines.is_empty() {
-        "No build output yet. Start a build from the Build page.".to_string()
+    let start = state.lines.len().saturating_sub(height);
+    let visible = &state.lines[start..];
+
+    let title = if state.running {
+        format!("{title} (running)")
     } else {
-        app.build_lines[start..].join("\n")
-    };
-    let title = if app.build_running {
-        "Build Status (running)"
-    } else {
-        "Build Status"
+        title.to_string()
     };
 
-    let status = Paragraph::new(text)
-        .block(Block::default().title(title).borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(status, area);
-}
-
-fn render_push_status(frame: &mut Frame, area: Rect, app: &App) {
-    let height = area.height.saturating_sub(2) as usize;
-    let start = app.push_lines.len().saturating_sub(height);
-    let text = if app.push_lines.is_empty() {
-        "No push output yet. Start a push from the Images page.".to_string()
+    // Build a Text from the line slice directly instead of joining into a
+    // fresh String every frame (avoids an O(n) allocation per render).
+    let text = if visible.is_empty() {
+        Text::from(empty_message)
     } else {
-        app.push_lines[start..].join("\n")
-    };
-    let title = if app.push_running {
-        "Push Status (running)"
-    } else {
-        "Push Status"
+        visible
+            .iter()
+            .map(|line| Line::from(line.as_str()))
+            .collect()
     };
 
     let status = Paragraph::new(text)
@@ -353,13 +359,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             .unwrap_or_else(|| "No build config selected.".to_string()),
         Screen::BuildStatus => format!(
             "Build status\n{}\n\n{} output lines",
-            if app.build_running { "Running" } else { "Idle" },
-            app.build_lines.len()
+            if app.build_state.running {
+                "Running"
+            } else {
+                "Idle"
+            },
+            app.build_state.lines.len()
         ),
         Screen::PushStatus => format!(
             "Push status\n{}\n\n{} output lines",
-            if app.push_running { "Running" } else { "Idle" },
-            app.push_lines.len()
+            if app.push_state.running {
+                "Running"
+            } else {
+                "Idle"
+            },
+            app.push_state.lines.len()
         ),
         Screen::Logs => format!("{} log lines", app.logs.len()),
     };

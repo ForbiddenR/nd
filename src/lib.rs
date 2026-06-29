@@ -198,7 +198,7 @@ fn run_build(app: &mut App) {
         return;
     }
 
-    if app.build_running {
+    if app.build_state.running {
         app.set_error("a build is already running");
         return;
     }
@@ -217,7 +217,7 @@ fn run_build(app: &mut App) {
 }
 
 fn run_push(app: &mut App) {
-    if app.push_running {
+    if app.push_state.running {
         app.set_error("a push is already running");
         return;
     }
