@@ -99,13 +99,15 @@ impl ProgressState {
         self.running = true;
     }
 
-    /// Drain all buffered events without blocking.
+    /// Drain all buffered events without blocking. Returns an empty vec when
+    /// no operation is running so idle ticks in the render loop are cheap.
     pub fn drain_events(&mut self) -> Vec<docker::ProgressEvent> {
+        let Some(receiver) = &self.events else {
+            return Vec::new();
+        };
         let mut events = Vec::new();
-        if let Some(receiver) = &self.events {
-            while let Ok(event) = receiver.try_recv() {
-                events.push(event);
-            }
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
         }
         events
     }

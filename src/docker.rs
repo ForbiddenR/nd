@@ -170,6 +170,11 @@ where
         // reads is decoded at a line boundary rather than per-chunk (which would
         // turn it into U+FFFD replacement characters).
         let mut pending: Vec<u8> = Vec::new();
+        // Index of the first unprocessed byte in `pending`. Searching and emitting
+        // lines advances this cursor; the processed prefix is dropped once per
+        // read instead of once per line, keeping the whole loop O(n) rather than
+        // O(n²) for output that uses many '\r' progress updates.
+        let mut start = 0usize;
 
         loop {
             match reader.read(&mut buf) {
@@ -180,25 +185,38 @@ where
 
             // nerdctl push/build emit progress with '\r' updates, not just '\n',
             // so split on either to stream output live instead of buffering until the end.
-            while let Some(pos) = pending.iter().position(|&b| b == b'\n' || b == b'\r') {
+            while let Some(rel) = pending[start..]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+            {
+                let pos = start + rel;
                 let delim = pending[pos];
-                let line: Vec<u8> = pending.drain(..pos).collect();
-                pending.drain(..1);
+
+                // Borrow the line bytes directly; from_utf8_lossy returns a
+                // borrowed Cow when the bytes are already valid UTF-8, so no
+                // extra allocation is needed in the common case.
+                let line = String::from_utf8_lossy(&pending[start..pos]).into_owned();
+                start = pos + 1;
 
                 // consume the '\n' of a '\r\n' pair so it isn't emitted as a blank line
-                if delim == b'\r' && pending.first() == Some(&b'\n') {
-                    pending.drain(..1);
+                if delim == b'\r' && pending.get(start) == Some(&b'\n') {
+                    start += 1;
                 }
 
-                let line = String::from_utf8_lossy(&line).into_owned();
                 if !line.trim().is_empty() {
                     let _ = tx.send(ProgressEvent::Line(line));
                 }
             }
+
+            // Drop the processed prefix once per read to bound `pending`'s growth.
+            if start > 0 {
+                pending.drain(..start);
+                start = 0;
+            }
         }
 
-        if !pending.is_empty() {
-            let line = String::from_utf8_lossy(&pending).into_owned();
+        if start < pending.len() {
+            let line = String::from_utf8_lossy(&pending[start..]).into_owned();
             if !line.trim().is_empty() {
                 let _ = tx.send(ProgressEvent::Line(line));
             }
@@ -255,7 +273,69 @@ fn parse_image(line: &str) -> Option<Image> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_container, parse_image};
+    use std::io::Read;
+
+    use super::{ProgressEvent, parse_container, parse_image, spawn_reader};
+
+    /// A reader that hands back data one fixed-size chunk per `read` call,
+    /// letting tests simulate multi-byte characters and lines split across
+    /// reads — exactly the case the byte-accumulating reader must handle.
+    struct ChunkedReader {
+        chunks: Vec<Vec<u8>>,
+        index: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.index >= self.chunks.len() {
+                return Ok(0);
+            }
+            let chunk = &self.chunks[self.index];
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            self.index += 1;
+            Ok(n)
+        }
+    }
+
+    fn collect_lines(chunks: Vec<Vec<u8>>) -> Vec<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = ChunkedReader { chunks, index: 0 };
+        let handle = spawn_reader(reader, tx);
+        handle.join().unwrap();
+
+        let mut lines = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProgressEvent::Line(line) = event {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn splits_on_carriage_return_and_newline() {
+        let lines = collect_lines(vec![b"pushing layer\rpulling done\nfinished\r\n".to_vec()]);
+
+        assert_eq!(lines, vec!["pushing layer", "pulling done", "finished"]);
+    }
+
+    #[test]
+    fn drops_blank_lines() {
+        let lines = collect_lines(vec![b"\n\r\n  \n".to_vec()]);
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn handles_multibyte_utf8_split_across_reads() {
+        // "é" is 0xC3 0xA9; split it across two reads so a per-chunk decoder
+        // would emit U+FFFD. The reader must accumulate bytes and decode at
+        // the line boundary instead.
+        let lines = collect_lines(vec![b"caf".to_vec(), vec![0xC3], vec![0xA9, b'\n']]);
+
+        assert_eq!(lines, vec!["café"]);
+    }
 
     #[test]
     fn parses_container_rows() {
