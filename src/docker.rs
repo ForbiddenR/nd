@@ -109,19 +109,28 @@ fn spawn_docker_stream(
     action_name: &'static str,
 ) -> Result<Receiver<ProgressEvent>> {
     let (tx, rx) = mpsc::channel();
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context(start_context)?;
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
     let success_message = success_message.to_string();
     let action_name = action_name.to_string();
 
     thread::spawn(move || {
+        let mut child = match command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = tx.send(ProgressEvent::Finished {
+                    success: false,
+                    message: format!("{start_context}: {err}"),
+                });
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         let mut readers = Vec::new();
 
         if let Some(stdout) = stdout {

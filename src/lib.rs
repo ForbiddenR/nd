@@ -233,7 +233,6 @@ fn run_push(app: &mut App) {
     match docker::push_image_stream(repo, tag) {
         Ok(receiver) => {
             app.start_push(receiver);
-            app.set_screen(Screen::PushStatus);
         }
         Err(err) => app.set_error(err),
     }
