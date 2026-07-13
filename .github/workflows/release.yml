@@ -1,8 +1,16 @@
 name: release
 
-# Build an optimized Linux binary whenever a release is published (i.e. when a
-# git tag like v0.1.0 is pushed with a GitHub Release attached), then upload
-# the binary to that release as a downloadable asset.
+# Build an optimized, fully static Linux binary whenever a release is published
+# (i.e. when a git tag like v0.1.0 is pushed with a GitHub Release attached),
+# then upload the binary to that release as a downloadable asset.
+#
+# The binary targets x86_64-unknown-linux-musl so it links against musl, not
+# glibc. The result has no dynamic library dependencies and runs on any Linux
+# distribution regardless of its glibc version (avoiding the
+# "GLIBC_2.xx not found" error a glibc-linked binary would hit on older
+# systems). This works because the only network dependency, reqwest, uses the
+# rustls TLS backend rather than native-tls/OpenSSL, so there is no system
+# library to link statically.
 on:
   release:
     types: [published]
@@ -18,16 +26,33 @@ jobs:
       - name: Check out the tag
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain with the musl target
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # musl-gcc is the linker for the musl target; not preinstalled on the
+      # GitHub runner.
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      # Release profile from Cargo.toml (lto, opt-level=s, strip) is applied
-      # automatically by --release.
-      - name: Build release binary
-        run: cargo build --release
+      # --release applies the release profile from Cargo.toml (lto, opt-level=s,
+      # strip). The binary lands in target/<target>/release/nd.
+      - name: Build static release binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Verify the binary is statically linked
+        run: |
+          # `file` reports "statically linked" for a plain static binary and
+          # "static-pie linked" for a static-PIE (which the musl target
+          # produces). Both are acceptable — either means no glibc dependency.
+          file target/x86_64-unknown-linux-musl/release/nd
+          file target/x86_64-unknown-linux-musl/release/nd \
+            | grep -Eq "statically linked|static-pie linked" \
+            || { echo "error: binary is not statically linked"; exit 1; }
 
       - name: Package the binary
         run: |
@@ -35,9 +60,9 @@ jobs:
           # downloaded asset is self-contained, and name it for the platform
           # so multiple OS releases can coexist.
           tag="${GITHUB_REF_NAME}"
-          staging="nd-${tag}-x86_64-unknown-linux-gnu"
+          staging="nd-${tag}-x86_64-unknown-linux-musl"
           mkdir "$staging"
-          cp target/release/nd "$staging/"
+          cp target/x86_64-unknown-linux-musl/release/nd "$staging/"
           cp README.md LICENSE "$staging/"
           tar czf "${staging}.tar.gz" "$staging"
           echo "asset=${staging}.tar.gz" >> "$GITHUB_ENV"

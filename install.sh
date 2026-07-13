@@ -30,9 +30,9 @@ trap cleanup EXIT
 # release workflow currently builds.
 arch="$(uname -m)"
 case "$arch" in
-    x86_64 | amd64) asset_arch="x86_64-unknown-linux-gnu" ;;
-    aarch64 | arm64) asset_arch="aarch64-unknown-linux-gnu" ;;
-    *) asset_arch="x86_64-unknown-linux-gnu" ;;
+    x86_64 | amd64) asset_arch="x86_64-unknown-linux-musl" ;;
+    aarch64 | arm64) asset_arch="aarch64-unknown-linux-musl" ;;
+    *) asset_arch="x86_64-unknown-linux-musl" ;;
 esac
 
 asset_name="nd-latest-${asset_arch}.tar.gz"

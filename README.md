@@ -22,8 +22,11 @@ Install the latest prebuilt Linux binary to `/usr/local/bin`:
 curl -fsSL https://raw.githubusercontent.com/ForbiddenR/nd/rs/install.sh | bash
 ```
 
-The script resolves the latest release tag, downloads the matching asset for
-your architecture, and installs `nd` to `/usr/local/bin/nd` (re-running with
+The release binary is built against musl and statically linked, so it has no
+glibc dependency and runs on any Linux distribution regardless of glibc
+version. The script resolves the latest release tag, downloads the matching
+asset for your architecture, and installs `nd` to `/usr/local/bin/nd`
+(re-running with
 `sudo` automatically if that directory isn't writable).
 
 Or build from source:
