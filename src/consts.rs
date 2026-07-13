@@ -11,7 +11,9 @@ pub const HELP_CONTAINERS: &str = "q quit | r refresh | tab switch | ↑/↓ sel
 pub const HELP_IMAGES: &str =
     "q quit | r refresh | tab switch | ↑/↓ select | d remove | p prune | s push";
 pub const HELP_BUILD: &str = "q quit | r refresh | tab switch | type path | enter build | backspace delete | ctrl-u clear | p prune builder";
-pub const HELP_BUILD_STATUS: &str = "q quit | tab switch | c clear finished build output";
-pub const HELP_PUSH_STATUS: &str = "q quit | tab switch | c clear finished push output";
+pub const HELP_BUILD_STATUS: &str =
+    "q quit | tab switch | c clear finished build output | esc cancel running build";
+pub const HELP_PUSH_STATUS: &str =
+    "q quit | tab switch | c clear finished push output | esc cancel running push";
 pub const HELP_LOGS: &str = "q quit | r refresh | tab switch | c clear logs";
 pub const HELP_MODAL: &str = "y confirm | n cancel | esc cancel";

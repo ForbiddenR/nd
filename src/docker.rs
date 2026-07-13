@@ -1,8 +1,12 @@
 use std::{
     io::Read,
-    process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -52,7 +56,10 @@ pub fn remove_container(id: &str) -> Result<String> {
     run_docker(&["rm", id])
 }
 
-pub fn push_image_stream(repository: String, tag: String) -> Result<Receiver<ProgressEvent>> {
+pub fn push_image_stream(
+    repository: String,
+    tag: String,
+) -> Result<(Receiver<ProgressEvent>, CancelHandle)> {
     let image = format!("{repository}:{tag}");
     let mut command = Command::new("nerdctl");
     command.args(["push", image.as_str()]);
@@ -84,7 +91,10 @@ pub fn system_prune() -> Result<String> {
     run_docker(&["system", "prune", "-f"])
 }
 
-pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<ProgressEvent>> {
+pub fn build_image_stream(
+    path: String,
+    tag: Option<String>,
+) -> Result<(Receiver<ProgressEvent>, CancelHandle)> {
     let mut command = Command::new("nerdctl");
     command.arg("build");
 
@@ -102,18 +112,97 @@ pub fn build_image_stream(path: String, tag: Option<String>) -> Result<Receiver<
     )
 }
 
+/// Handle to a backgrounded `nerdctl` child process, allowing the caller to
+/// kill it (on quit or an explicit cancel) even while the stream thread is
+/// still waiting for it to exit. Dropping the handle does nothing; only
+/// `cancel` sends a signal. Without this, quitting the TUI would orphan the
+/// still-running `nerdctl` process, since Rust does not kill a `Child` on
+/// drop on Unix.
+///
+/// `cancel` is reliable even when it is called before the stream thread has
+/// published the child into shared state: it records a "kill requested" flag,
+/// and `poll_child` applies that pending kill once the child exists. This
+/// matters because the esc-cancel path calls `cancel` exactly once, so that
+/// single request must not be lost if it arrives during process startup.
+#[derive(Debug)]
+pub struct CancelHandle {
+    shared: Arc<Mutex<ChildSlot>>,
+}
+
+/// Shared state between the stream thread (which polls) and any
+/// `CancelHandle` (which kills). The `kill_requested` flag persists until the
+/// process is reaped, so a cancel that arrives before the child is published
+/// is honored on the first poll instead of being dropped.
+#[derive(Debug)]
+struct ChildSlot {
+    child: Option<Child>,
+    kill_requested: bool,
+}
+
+impl CancelHandle {
+    /// Send SIGKILL to the child if it is still running, or remember the
+    /// request so the poll loop applies it on the next poll. Safe to call
+    /// after the process has already exited: the slot is cleared once it is
+    /// reaped, so this becomes a no-op.
+    pub fn cancel(&self) {
+        let mut slot = self.shared.lock().unwrap();
+        slot.kill_requested = true;
+        if let Some(child) = slot.child.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// Poll the shared child once. Returns `Some(status)` once the process has
+/// exited (and reaps it, clearing the slot), or `None` to keep polling. If a
+/// pending cancel was requested before or during startup, this function kills
+/// the child before putting it back into the slot.
+fn poll_child(shared: &Mutex<ChildSlot>) -> Option<Option<ExitStatus>> {
+    let mut slot = shared.lock().unwrap();
+    match slot.child.take() {
+        Some(mut child) => match child.try_wait() {
+            // Exited: `try_wait` already reaped it; don't put it back. Clear
+            // the kill request so a later cancel is a clean no-op.
+            Ok(Some(status)) => {
+                slot.kill_requested = false;
+                Some(Some(status))
+            }
+            // Still running: honor any pending cancel, then put it back so
+            // cancel can also find it directly next time.
+            Ok(None) => {
+                if slot.kill_requested {
+                    let _ = child.kill();
+                }
+                slot.child = Some(child);
+                None
+            }
+            // `try_wait` failed: drop the child and treat as exited without status.
+            Err(_) => Some(None),
+        },
+        // Slot already empty (e.g. cancelled/finished): nothing to wait on.
+        None => Some(None),
+    }
+}
+
 fn spawn_docker_stream(
     mut command: Command,
     start_context: &'static str,
     success_message: &'static str,
     action_name: &'static str,
-) -> Result<Receiver<ProgressEvent>> {
+) -> Result<(Receiver<ProgressEvent>, CancelHandle)> {
     let (tx, rx) = mpsc::channel();
+    let shared = Arc::new(Mutex::new(ChildSlot {
+        child: None,
+        kill_requested: false,
+    }));
+    let handle = CancelHandle {
+        shared: Arc::clone(&shared),
+    };
     let success_message = success_message.to_string();
     let action_name = action_name.to_string();
 
     thread::spawn(move || {
-        let mut child = match command
+        let mut spawned = match command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -129,8 +218,12 @@ fn spawn_docker_stream(
             }
         };
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = spawned.stdout.take();
+        let stderr = spawned.stderr.take();
+        // Hand the process handle to the shared slot so CancelHandle::cancel
+        // can kill it while we wait below.
+        shared.lock().unwrap().child = Some(spawned);
+
         let mut readers = Vec::new();
 
         if let Some(stdout) = stdout {
@@ -141,31 +234,40 @@ fn spawn_docker_stream(
             readers.push(spawn_reader(stderr, tx.clone()));
         }
 
-        let wait_result = child.wait();
+        // Poll for exit instead of blocking on `wait()` so a concurrent
+        // `cancel()` can still acquire the slot and kill the child. Polling at
+        // the UI tick rate is negligible for operations that run seconds to
+        // minutes.
+        let exit_status: Option<ExitStatus> = loop {
+            if let Some(status) = poll_child(&shared) {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
 
         for reader in readers {
             let _ = reader.join();
         }
 
-        let event = match wait_result {
-            Ok(status) if status.success() => ProgressEvent::Finished {
+        let event = match exit_status {
+            Some(status) if status.success() => ProgressEvent::Finished {
                 success: true,
                 message: success_message,
             },
-            Ok(status) => ProgressEvent::Finished {
+            Some(status) => ProgressEvent::Finished {
                 success: false,
                 message: format!("{action_name} exited with status {status}"),
             },
-            Err(err) => ProgressEvent::Finished {
+            None => ProgressEvent::Finished {
                 success: false,
-                message: format!("failed to wait for {action_name}: {err}"),
+                message: format!("failed to wait for {action_name}"),
             },
         };
 
         let _ = tx.send(event);
     });
 
-    Ok(rx)
+    Ok((rx, handle))
 }
 
 fn spawn_reader<R>(reader: R, tx: Sender<ProgressEvent>) -> thread::JoinHandle<()>
@@ -282,9 +384,12 @@ fn parse_image(line: &str) -> Option<Image> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::{
+        io::Read,
+        time::{Duration, Instant},
+    };
 
-    use super::{ProgressEvent, parse_container, parse_image, spawn_reader};
+    use super::{ProgressEvent, parse_container, parse_image, spawn_docker_stream, spawn_reader};
 
     /// A reader that hands back data one fixed-size chunk per `read` call,
     /// letting tests simulate multi-byte characters and lines split across
@@ -364,5 +469,82 @@ mod tests {
         assert_eq!(image.tag, "latest");
         assert_eq!(image.id, "sha256abc");
         assert_eq!(image.size, "187MB");
+    }
+
+    /// The core of the orphaned-process fix: cancelling a running stream must
+    /// actually kill the child so it doesn't outlive the caller. `sleep 30`
+    /// would block for half a minute if not killed; the test fails (via the
+    /// 5 s deadline) if cancel doesn't terminate it. Cancel is retried in a
+    /// loop so a call that races ahead of process startup still lands once the
+    /// handle is published.
+    #[test]
+    fn cancel_kills_running_child() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+
+        let (rx, handle) =
+            spawn_docker_stream(command, "failed to start sleep", "sleep completed", "sleep")
+                .expect("spawning sleep should succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                panic!("cancel did not produce a Finished event within 5 s");
+            }
+
+            // Retry cancel in case the first call landed before the child was
+            // published to the shared slot. Idempotent once reaped.
+            handle.cancel();
+
+            // `sleep` produces no output, so any event we receive is the
+            // Finished report from the killed process.
+            if let Ok(ProgressEvent::Finished { success, message }) = rx.try_recv() {
+                assert!(
+                    !success,
+                    "a cancelled child must not report success: {message}"
+                );
+                return;
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The esc-cancel path calls `cancel` exactly once (no retry loop). This
+    /// must be enough to kill the child; the `kill_requested` flag carries the
+    /// request forward if it arrives before the stream thread has published the
+    /// child. `sleep 30` would block for half a minute if the single cancel
+    /// were lost; the test fails (via the 5 s deadline) if the kill doesn't
+    /// land.
+    #[test]
+    fn single_cancel_kills_running_child() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+
+        let (rx, handle) =
+            spawn_docker_stream(command, "failed to start sleep", "sleep completed", "sleep")
+                .expect("spawning sleep should succeed");
+
+        // Give the stream thread time to publish the child to the shared slot,
+        // then cancel exactly once - mirroring a single esc keypress.
+        std::thread::sleep(Duration::from_millis(200));
+        handle.cancel();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                panic!("a single cancel did not produce a Finished event within 5 s");
+            }
+
+            if let Ok(ProgressEvent::Finished { success, message }) = rx.try_recv() {
+                assert!(
+                    !success,
+                    "a cancelled child must not report success: {message}"
+                );
+                return;
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

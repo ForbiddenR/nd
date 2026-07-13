@@ -1,17 +1,10 @@
 [package]
 name = "nd"
 version = "0.1.0"
-description = "An example generated using the hello-world template"
+description = "A terminal UI for managing nerdctl containers, images, and builds"
 authors = ["ForbiddenR"]
 license = "MIT"
 edition = "2024"
-
-[workspace]
-members = ["app", "ratatui-json-editor"]
-
-# [[bin]]
-# name = "json-editor"
-# path = "ratatui-json-editor/src/main.rs"
 
 [dependencies]
 anyhow = "1"

@@ -8,10 +8,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{
-        DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, poll,
-    },
+    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -26,7 +23,7 @@ use crate::app::{App, Modal, Screen};
 pub fn run_tui() -> Result<()> {
     enable_raw_mode()?;
     let mut stderr = std::io::stderr();
-    execute!(stderr, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stderr, EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
@@ -36,11 +33,7 @@ pub fn run_tui() -> Result<()> {
 
     let cleanup_result = (|| -> Result<()> {
         disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-        )?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
         Ok(())
     })();
@@ -61,6 +54,8 @@ where
     while !app.should_quit {
         app.poll_build_events();
         app.poll_push_events();
+        app.poll_refresh_events();
+        app.poll_action_events();
         terminal.draw(|frame| ui(frame, app))?;
 
         if poll(Duration::from_millis(100))?
@@ -73,6 +68,10 @@ where
             handle_key(app, key);
         }
     }
+
+    // Kill any build/push still running in the background so they don't
+    // outlive the TUI as orphaned `nerdctl` processes.
+    app.cancel_running_tasks();
 
     Ok(())
 }
@@ -90,7 +89,13 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true
         }
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => {
+            if app.has_running_tasks() {
+                app.open_modal(Modal::ConfirmQuit);
+            } else {
+                app.should_quit = true;
+            }
+        }
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Tab => app.next_screen(),
         KeyCode::BackTab => app.previous_screen(),
@@ -142,6 +147,8 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if app.screen == Screen::BuildStatus => app.clear_build_lines(),
         KeyCode::Char('c') if app.screen == Screen::PushStatus => app.clear_push_lines(),
         KeyCode::Char('c') if app.screen == Screen::Logs => app.clear_logs(),
+        KeyCode::Esc if app.screen == Screen::BuildStatus => app.cancel_build(),
+        KeyCode::Esc if app.screen == Screen::PushStatus => app.cancel_push(),
         KeyCode::Char(character) if app.screen == Screen::Build => {
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                 app.input.push(character);
@@ -162,7 +169,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         | Modal::ConfirmRemoveImage
         | Modal::ConfirmImagePrune
         | Modal::ConfirmBuilderPrune
-        | Modal::ConfirmSystemPrune => handle_confirmation_key(app, modal, key),
+        | Modal::ConfirmSystemPrune
+        | Modal::ConfirmQuit => handle_confirmation_key(app, modal, key),
     }
 }
 
@@ -183,6 +191,7 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
                     run_action(app, "builder pruned", docker::prune_builder)
                 }
                 Modal::ConfirmSystemPrune => run_action(app, "system pruned", docker::system_prune),
+                Modal::ConfirmQuit => app.should_quit = true,
             }
         }
         KeyCode::Char('n') | KeyCode::Esc => app.close_modal(),
@@ -203,13 +212,11 @@ fn run_build(app: &mut App) {
         return;
     }
 
-    let tag = app
-        .selected_config()
-        .and_then(|config| config.build_tag.clone());
+    let tag = app.selected_config().and_then(|config| config.tag.clone());
 
     match docker::build_image_stream(path, tag) {
-        Ok(receiver) => {
-            app.start_build(receiver);
+        Ok((receiver, cancel)) => {
+            app.start_build(receiver, cancel);
             app.set_screen(Screen::BuildStatus);
         }
         Err(err) => app.set_error(err),
@@ -231,8 +238,8 @@ fn run_push(app: &mut App) {
     };
 
     match docker::push_image_stream(repo, tag) {
-        Ok(receiver) => {
-            app.start_push(receiver);
+        Ok((receiver, cancel)) => {
+            app.start_push(receiver, cancel);
         }
         Err(err) => app.set_error(err),
     }
@@ -267,7 +274,9 @@ fn with_selected_container(
         return;
     };
 
-    run_action(app, format!("container {success_status}"), || action(&id));
+    run_action(app, format!("container {success_status}"), move || {
+        action(&id)
+    });
 }
 
 fn with_selected_image(
@@ -283,23 +292,14 @@ fn with_selected_image(
         return;
     };
 
-    run_action(app, format!("image {success_status}"), || {
+    run_action(app, format!("image {success_status}"), move || {
         action(&repo, Some(&tag))
     });
 }
 
 fn run_action<F>(app: &mut App, success_status: impl Into<String>, action: F)
 where
-    F: FnOnce() -> Result<String>,
+    F: FnOnce() -> Result<String> + Send + 'static,
 {
-    let success_status = success_status.into();
-
-    match action() {
-        Ok(output) => {
-            app.set_status(success_status);
-            app.push_log(output);
-            app.refresh();
-        }
-        Err(err) => app.set_error(err),
-    }
+    app.start_action(success_status, action);
 }

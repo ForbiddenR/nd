@@ -230,7 +230,7 @@ fn render_build(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 " "
             };
-            let tag = config.build_tag.as_deref().unwrap_or("<no tag resolved>");
+            let tag = config.tag.as_deref().unwrap_or("<no tag resolved>");
             let version = config.latest_version.as_deref().unwrap_or("<not resolved>");
             let url = config.version_url.as_deref().unwrap_or("<no version url>");
             let style = if index == app.selected_build_tag {
@@ -298,12 +298,20 @@ fn render_progress_status(
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
+    // Show only the lines that fit in the visible area, tailing the newest.
     let height = area.height.saturating_sub(2) as usize;
     let start = app.logs.len().saturating_sub(height);
-    let text = if app.logs.is_empty() {
-        "No logs yet.".to_string()
+    let visible = &app.logs[start..];
+
+    // Build a Text from the line slice directly instead of joining into a
+    // fresh String every frame (avoids an O(n) allocation per render).
+    let text = if visible.is_empty() {
+        Text::from("No logs yet.")
     } else {
-        app.logs[start..].join("\n")
+        visible
+            .iter()
+            .map(|line| Line::from(line.as_str()))
+            .collect()
     };
 
     let logs = Paragraph::new(text)
@@ -349,11 +357,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                         app.input.as_str()
                     },
                     config
-                        .build_tag_template
+                        .tag_template
                         .as_deref()
                         .unwrap_or("No tag template."),
                     config.latest_version.as_deref().unwrap_or("Not resolved."),
-                    config.build_tag.as_deref().unwrap_or("No tag resolved.")
+                    config.tag.as_deref().unwrap_or("No tag resolved.")
                 )
             })
             .unwrap_or_else(|| "No build config selected.".to_string()),
@@ -451,6 +459,15 @@ fn render_modal(frame: &mut Frame, app: &App) {
             "Remove unused Docker data?".to_string(),
             HELP_MODAL,
         ),
+        Modal::ConfirmQuit => {
+            let body = match (app.build_state.running, app.push_state.running) {
+                (true, true) => "A build and a push are still running. Quit anyway?".to_string(),
+                (true, false) => "A build is still running. Quit anyway?".to_string(),
+                (false, true) => "A push is still running. Quit anyway?".to_string(),
+                (false, false) => "Quit?".to_string(),
+            };
+            ("Quit", body, HELP_MODAL)
+        }
     };
 
     let modal = Paragraph::new(format!("{body}\n\n{help}"))

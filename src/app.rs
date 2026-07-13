@@ -1,4 +1,7 @@
-use std::sync::mpsc::Receiver;
+use std::{
+    sync::mpsc::{self, Receiver},
+    thread,
+};
 
 use crate::{config, docker};
 
@@ -55,6 +58,7 @@ pub enum Modal {
     ConfirmBuilderPrune,
     ConfirmSystemPrune,
     ConfirmPushImage,
+    ConfirmQuit,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +86,7 @@ pub struct ProgressState {
     pub lines: Vec<String>,
     pub running: bool,
     events: Option<Receiver<docker::ProgressEvent>>,
+    cancel: Option<docker::CancelHandle>,
 }
 
 impl ProgressState {
@@ -90,12 +95,18 @@ impl ProgressState {
             lines: Vec::new(),
             running: false,
             events: None,
+            cancel: None,
         }
     }
 
-    pub fn start(&mut self, receiver: Receiver<docker::ProgressEvent>) {
+    pub fn start(
+        &mut self,
+        receiver: Receiver<docker::ProgressEvent>,
+        cancel: docker::CancelHandle,
+    ) {
         self.lines.clear();
         self.events = Some(receiver);
+        self.cancel = Some(cancel);
         self.running = true;
     }
 
@@ -113,10 +124,20 @@ impl ProgressState {
     }
 
     /// Called when a Finished event arrives. Clears the running flag and
-    /// drops the receiver.
+    /// drops the receiver and cancel handle.
     pub fn handle_finished(&mut self) {
         self.running = false;
         self.events = None;
+        self.cancel = None;
+    }
+
+    /// Send SIGKILL to the running child, if any. The actual `Finished` event
+    /// arrives later via `drain_events`, so the status/error is updated then.
+    /// No-op when nothing is running.
+    pub fn cancel(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
     }
 
     /// Clear output lines if not running. Returns true if cleared.
@@ -144,6 +165,31 @@ impl ProgressState {
     }
 }
 
+/// Result of a background refresh, produced off the UI thread so listing
+/// containers/images and resolving config (which may make a network call)
+/// don't block the render loop.
+#[derive(Debug)]
+pub enum RefreshEvent {
+    Done {
+        configs: anyhow::Result<config::BuildConfig>,
+        containers: anyhow::Result<Vec<Container>>,
+        images: anyhow::Result<Vec<Image>>,
+    },
+}
+
+/// Result of a background one-shot action (remove container/image, prune).
+/// These run `nerdctl` to completion with captured output, which can take
+/// several seconds for prunes - running them off the UI thread keeps the TUI
+/// responsive. Only one action runs at a time; starting another while one is
+/// in flight is rejected with an error.
+#[derive(Debug)]
+pub enum ActionEvent {
+    Done {
+        success_status: String,
+        result: anyhow::Result<String>,
+    },
+}
+
 #[derive(Debug)]
 pub struct App {
     pub should_quit: bool,
@@ -157,17 +203,12 @@ pub struct App {
     pub status: String,
     pub logs: Vec<String>,
     pub input: String,
-    pub configs: Vec<Config>,
+    pub configs: Vec<config::Config>,
     pub build_state: ProgressState,
     pub push_state: ProgressState,
-}
-
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub build_tag_template: Option<String>,
-    pub build_tag: Option<String>,
-    pub latest_version: Option<String>,
-    pub version_url: Option<String>,
+    refresh_events: Option<Receiver<RefreshEvent>>,
+    refresh_pending: bool,
+    action_events: Option<Receiver<ActionEvent>>,
 }
 
 impl App {
@@ -187,24 +228,117 @@ impl App {
             configs: vec![],
             build_state: ProgressState::new(),
             push_state: ProgressState::new(),
+            refresh_events: None,
+            refresh_pending: false,
+            action_events: None,
         }
     }
 
+    /// Kick off a background refresh. Listing containers/images and resolving
+    /// config (which may make a network request with a 10 s timeout) would
+    /// block the render loop, so the work runs on a thread and the result is
+    /// applied via `poll_refresh_events`. A refresh requested while one is
+    /// already in flight is deferred until the current one finishes.
     pub fn refresh(&mut self) {
+        if self.refresh_events.is_some() {
+            self.refresh_pending = true;
+            return;
+        }
+        self.start_refresh();
+    }
+
+    fn start_refresh(&mut self) {
+        self.refresh_events = Some(spawn_refresh());
+        self.status = "refreshing...".to_string();
+    }
+
+    /// Drain a completed refresh (if any) and apply the results. Called each
+    /// tick from the main loop so it stays non-blocking.
+    pub fn poll_refresh_events(&mut self) {
+        let Some(receiver) = &self.refresh_events else {
+            return;
+        };
+
+        if let Ok(RefreshEvent::Done {
+            configs,
+            containers,
+            images,
+        }) = receiver.try_recv()
+        {
+            self.refresh_events = None;
+            self.apply_refresh(configs, containers, images);
+
+            if self.refresh_pending {
+                self.refresh_pending = false;
+                self.start_refresh();
+            }
+        }
+    }
+
+    /// Kick off a one-shot action (remove, prune) on a background thread.
+    /// The action runs `nerdctl` to completion, which can take several seconds
+    /// for prune operations; running it off the UI thread keeps the TUI
+    /// responsive. The result is applied via `poll_action_events`. Only one
+    /// action runs at a time - a second request while one is in flight is
+    /// rejected with an error.
+    pub fn start_action<F>(&mut self, success_status: impl Into<String>, action: F)
+    where
+        F: FnOnce() -> anyhow::Result<String> + Send + 'static,
+    {
+        if self.action_events.is_some() {
+            self.set_error("an action is already running");
+            return;
+        }
+
+        let success_status = success_status.into();
+        let (tx, rx) = mpsc::channel();
+        self.action_events = Some(rx);
+        self.status = format!("{success_status}...");
+
+        thread::spawn(move || {
+            let result = action();
+            let _ = tx.send(ActionEvent::Done {
+                success_status,
+                result,
+            });
+        });
+    }
+
+    /// Drain a completed action (if any) and apply the result. Called each tick
+    /// from the main loop so it stays non-blocking.
+    pub fn poll_action_events(&mut self) {
+        let Some(receiver) = &self.action_events else {
+            return;
+        };
+
+        if let Ok(ActionEvent::Done {
+            success_status,
+            result,
+        }) = receiver.try_recv()
+        {
+            self.action_events = None;
+            match result {
+                Ok(output) => {
+                    self.set_status(success_status);
+                    self.push_log(output);
+                    self.refresh();
+                }
+                Err(err) => self.set_error(err),
+            }
+        }
+    }
+
+    fn apply_refresh(
+        &mut self,
+        configs: anyhow::Result<config::BuildConfig>,
+        containers: anyhow::Result<Vec<Container>>,
+        images: anyhow::Result<Vec<Image>>,
+    ) {
         let mut refreshed = true;
 
-        match config::read_build_config() {
+        match configs {
             Ok(build_config) => {
-                self.configs = build_config
-                    .configs
-                    .into_iter()
-                    .map(|config| Config {
-                        build_tag_template: config.tag_template,
-                        build_tag: config.tag,
-                        latest_version: config.latest_version,
-                        version_url: config.version_url,
-                    })
-                    .collect();
+                self.configs = build_config.configs;
                 self.clamp_build_selection();
             }
             Err(err) => {
@@ -213,7 +347,7 @@ impl App {
             }
         }
 
-        match docker::list_containers() {
+        match containers {
             Ok(containers) => {
                 self.containers = containers;
                 self.clamp_container_selection();
@@ -224,7 +358,7 @@ impl App {
             }
         }
 
-        match docker::list_images() {
+        match images {
             Ok(images) => {
                 self.images = images;
                 self.clamp_image_selection();
@@ -297,7 +431,7 @@ impl App {
         self.images.get(self.selected_image)
     }
 
-    pub fn selected_config(&self) -> Option<&Config> {
+    pub fn selected_config(&self) -> Option<&config::Config> {
         self.configs.get(self.selected_build_tag)
     }
 
@@ -307,6 +441,18 @@ impl App {
 
     pub fn close_modal(&mut self) {
         self.modal = None;
+    }
+
+    /// Returns true if a build or push is still running in the background.
+    pub fn has_running_tasks(&self) -> bool {
+        self.build_state.running || self.push_state.running
+    }
+
+    /// Kill any running build/push children so they don't survive the TUI as
+    /// orphaned `nerdctl` processes. Called on quit.
+    pub fn cancel_running_tasks(&mut self) {
+        self.build_state.cancel();
+        self.push_state.cancel();
     }
 
     pub fn push_log(&mut self, message: impl Into<String>) {
@@ -330,9 +476,20 @@ impl App {
         self.status = "logs cleared".to_string();
     }
 
-    pub fn start_build(&mut self, receiver: Receiver<docker::ProgressEvent>) {
-        self.build_state.start(receiver);
+    pub fn start_build(
+        &mut self,
+        receiver: Receiver<docker::ProgressEvent>,
+        cancel: docker::CancelHandle,
+    ) {
+        self.build_state.start(receiver, cancel);
         self.status = "build started".to_string();
+    }
+
+    pub fn cancel_build(&mut self) {
+        if self.build_state.running {
+            self.build_state.cancel();
+            self.status = "cancelling build...".to_string();
+        }
     }
 
     pub fn poll_build_events(&mut self) {
@@ -361,9 +518,20 @@ impl App {
         }
     }
 
-    pub fn start_push(&mut self, receiver: Receiver<docker::ProgressEvent>) {
-        self.push_state.start(receiver);
+    pub fn start_push(
+        &mut self,
+        receiver: Receiver<docker::ProgressEvent>,
+        cancel: docker::CancelHandle,
+    ) {
+        self.push_state.start(receiver, cancel);
         self.status = "push started".to_string();
+    }
+
+    pub fn cancel_push(&mut self) {
+        if self.push_state.running {
+            self.push_state.cancel();
+            self.status = "cancelling push...".to_string();
+        }
     }
 
     pub fn poll_push_events(&mut self) {
@@ -429,4 +597,22 @@ impl App {
                 .min(self.configs.len().saturating_sub(1));
         }
     }
+}
+
+/// Run all three refresh sources on a background thread and send a single
+/// `RefreshEvent::Done` back. Each source is wrapped in its own `Result` so a
+/// failure in one (e.g. a config network error) doesn't discard the others.
+fn spawn_refresh() -> Receiver<RefreshEvent> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let configs = config::read_build_config();
+        let containers = docker::list_containers();
+        let images = docker::list_images();
+        let _ = tx.send(RefreshEvent::Done {
+            configs,
+            containers,
+            images,
+        });
+    });
+    rx
 }
