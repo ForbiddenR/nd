@@ -7,7 +7,7 @@
 # be curl|bash safe: passes set -euo pipefail, only writes inside the install
 # prefix plus a temporary staging directory it cleans up on exit.
 #
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/rs/install.sh | bash
 #
 # Or, after cloning:
 #   ./install.sh
@@ -16,6 +16,8 @@ set -euo pipefail
 
 # Repo in <owner>/<repo> form. Override with ND_REPO to point at a fork.
 : "${ND_REPO:=ForbiddenR/nd}"
+# Git ref containing this installer. Override when a fork uses another branch.
+: "${ND_INSTALL_REF:=rs}"
 
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="nd"
@@ -55,11 +57,11 @@ if [ ! -w "$INSTALL_DIR" ]; then
     if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
         printf 'install dir %s is not writable; re-running with sudo\n' "$INSTALL_DIR" >&2
         if [ -f "$0" ]; then
-            exec sudo -E env ND_REPO="$ND_REPO" INSTALL_DIR="$INSTALL_DIR" bash "$0" "$@"
+            exec sudo -E env ND_REPO="$ND_REPO" ND_INSTALL_REF="$ND_INSTALL_REF" INSTALL_DIR="$INSTALL_DIR" bash "$0" "$@"
         else
             script="${TMPDIR_ROOT}/install.sh"
-            curl -fsSL "https://raw.githubusercontent.com/${ND_REPO}/main/install.sh" -o "$script"
-            exec sudo -E env ND_REPO="$ND_REPO" INSTALL_DIR="$INSTALL_DIR" bash "$script" "$@"
+            curl -fsSL "https://raw.githubusercontent.com/${ND_REPO}/${ND_INSTALL_REF}/install.sh" -o "$script"
+            exec sudo -E env ND_REPO="$ND_REPO" ND_INSTALL_REF="$ND_INSTALL_REF" INSTALL_DIR="$INSTALL_DIR" bash "$script" "$@"
         fi
     fi
     printf 'error: cannot write to %s and sudo is unavailable\n' "$INSTALL_DIR" >&2

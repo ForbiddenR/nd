@@ -48,13 +48,13 @@ impl Screen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Modal {
-    ConfirmRemoveContainer,
-    ConfirmRemoveImage,
-    ConfirmImagePrune,
-    ConfirmBuilderPrune,
-    ConfirmSystemPrune,
-    ConfirmPushImage,
-    ConfirmQuit,
+    RemoveContainer,
+    RemoveImage,
+    ImagePrune,
+    BuilderPrune,
+    SystemPrune,
+    PushImage,
+    Quit,
 }
 
 #[derive(Debug, Clone)]

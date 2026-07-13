@@ -1,3 +1,3 @@
 [[configs]]
 tag_template = "cswxn/claude:v{version}"
-version_url = " https://registry.npmjs.org/@anthropic-ai/claude-code/latest"
+version_url = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest"

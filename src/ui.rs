@@ -498,14 +498,14 @@ fn render_modal(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let (title, body, help) = match modal {
-        Modal::ConfirmRemoveContainer => {
+        Modal::RemoveContainer => {
             let target = app
                 .selected_container()
                 .map(|container| format!("{} ({})", container.names, container.id))
                 .unwrap_or_else(|| "selected container".to_string());
             ("Remove container", format!("Remove {target}?"), HELP_MODAL)
         }
-        Modal::ConfirmPushImage => {
+        Modal::PushImage => {
             let target = app
                 .selected_image()
                 .map(|image| format!("{}:{} ({})", image.repository, image.tag, image.id))
@@ -516,29 +516,29 @@ fn render_modal(frame: &mut Frame, app: &App) {
                 HELP_MODAL,
             )
         }
-        Modal::ConfirmRemoveImage => {
+        Modal::RemoveImage => {
             let target = app
                 .selected_image()
                 .map(|image| format!("{}:{} ({})", image.repository, image.tag, image.id))
                 .unwrap_or_else(|| "selected image".to_string());
             ("Remove image", format!("Remove {target}?"), HELP_MODAL)
         }
-        Modal::ConfirmImagePrune => (
+        Modal::ImagePrune => (
             "Prune images",
             "Remove unused dangling images?".to_string(),
             HELP_MODAL,
         ),
-        Modal::ConfirmBuilderPrune => (
+        Modal::BuilderPrune => (
             "Prune builder",
             "Remove builder cache?".to_string(),
             HELP_MODAL,
         ),
-        Modal::ConfirmSystemPrune => (
+        Modal::SystemPrune => (
             "System prune",
             "Remove unused Docker data?".to_string(),
             HELP_MODAL,
         ),
-        Modal::ConfirmQuit => {
+        Modal::Quit => {
             let running = app.tasks.iter().filter(|task| task.is_running()).count();
             let body = match running {
                 0 => "Quit?".to_string(),

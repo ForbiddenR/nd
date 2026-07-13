@@ -90,7 +90,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('q') => {
             if app.has_running_tasks() {
-                app.open_modal(Modal::ConfirmQuit);
+                app.open_modal(Modal::Quit);
             } else {
                 app.should_quit = true;
             }
@@ -115,23 +115,19 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             with_selected_container(app, "restarted", docker::restart_container)
         }
         KeyCode::Char('d') if app.screen == Screen::Containers => {
-            open_if_container_selected(app, Modal::ConfirmRemoveContainer)
+            open_if_container_selected(app, Modal::RemoveContainer)
         }
         KeyCode::Char('p') if app.screen == Screen::Containers => {
-            app.open_modal(Modal::ConfirmSystemPrune)
+            app.open_modal(Modal::SystemPrune)
         }
         KeyCode::Char('d') if app.screen == Screen::Images => {
-            open_if_image_selected(app, Modal::ConfirmRemoveImage)
+            open_if_image_selected(app, Modal::RemoveImage)
         }
-        KeyCode::Char('p') if app.screen == Screen::Images => {
-            app.open_modal(Modal::ConfirmImagePrune)
-        }
+        KeyCode::Char('p') if app.screen == Screen::Images => app.open_modal(Modal::ImagePrune),
         KeyCode::Char('s') if app.screen == Screen::Images => {
-            app.open_modal(Modal::ConfirmPushImage);
+            app.open_modal(Modal::PushImage);
         }
-        KeyCode::Char('p') if app.screen == Screen::Build => {
-            app.open_modal(Modal::ConfirmBuilderPrune)
-        }
+        KeyCode::Char('p') if app.screen == Screen::Build => app.open_modal(Modal::BuilderPrune),
         KeyCode::Enter if app.screen == Screen::Build => run_build(app),
         KeyCode::Backspace if app.screen == Screen::Build => {
             app.input.pop();
@@ -146,10 +142,11 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if app.screen == Screen::Logs => app.clear_logs(),
         KeyCode::Char('d') if app.screen == Screen::Tasks => app.delete_selected_task(),
         KeyCode::Esc if app.screen == Screen::Tasks => app.cancel_selected_task(),
-        KeyCode::Char(character) if app.screen == Screen::Build => {
-            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-                app.input.push(character);
-            }
+        KeyCode::Char(character)
+            if app.screen == Screen::Build
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+        {
+            app.input.push(character);
         }
         _ => {}
     }
@@ -161,13 +158,13 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     };
 
     match modal {
-        Modal::ConfirmRemoveContainer
-        | Modal::ConfirmPushImage
-        | Modal::ConfirmRemoveImage
-        | Modal::ConfirmImagePrune
-        | Modal::ConfirmBuilderPrune
-        | Modal::ConfirmSystemPrune
-        | Modal::ConfirmQuit => handle_confirmation_key(app, modal, key),
+        Modal::RemoveContainer
+        | Modal::PushImage
+        | Modal::RemoveImage
+        | Modal::ImagePrune
+        | Modal::BuilderPrune
+        | Modal::SystemPrune
+        | Modal::Quit => handle_confirmation_key(app, modal, key),
     }
 }
 
@@ -176,19 +173,15 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
         KeyCode::Char('y') => {
             app.close_modal();
             match modal {
-                Modal::ConfirmRemoveContainer => {
+                Modal::RemoveContainer => {
                     with_selected_container(app, "removed", docker::remove_container)
                 }
-                Modal::ConfirmPushImage => run_push(app),
-                Modal::ConfirmRemoveImage => {
-                    with_selected_image(app, "removed", docker::remove_image)
-                }
-                Modal::ConfirmImagePrune => run_action(app, "images pruned", docker::prune_images),
-                Modal::ConfirmBuilderPrune => {
-                    run_action(app, "builder pruned", docker::prune_builder)
-                }
-                Modal::ConfirmSystemPrune => run_action(app, "system pruned", docker::system_prune),
-                Modal::ConfirmQuit => app.should_quit = true,
+                Modal::PushImage => run_push(app),
+                Modal::RemoveImage => with_selected_image(app, "removed", docker::remove_image),
+                Modal::ImagePrune => run_action(app, "images pruned", docker::prune_images),
+                Modal::BuilderPrune => run_action(app, "builder pruned", docker::prune_builder),
+                Modal::SystemPrune => run_action(app, "system pruned", docker::system_prune),
+                Modal::Quit => app.should_quit = true,
             }
         }
         KeyCode::Char('n') | KeyCode::Esc => app.close_modal(),
