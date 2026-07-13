@@ -249,10 +249,11 @@ fn render_build(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tasks(frame: &mut Frame, area: Rect, app: &App) {
     // Split the Tasks screen into a left list of tasks and a right pane
-    // showing the selected task's streaming output.
+    // showing the selected task's streaming output. The list is a fixed width
+    // so the output pane grows with the terminal; both panes fill the height.
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(34), Constraint::Min(20)])
+        .constraints([Constraint::Length(40), Constraint::Min(20)])
         .split(area);
 
     render_task_list(frame, chunks[0], app);
@@ -260,23 +261,34 @@ fn render_tasks(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_task_list(frame: &mut Frame, area: Rect, app: &App) {
+    let title = format!("Tasks ({})", app.tasks.len());
+
     if app.tasks.is_empty() {
         render_empty(
             frame,
             area,
-            "Tasks",
+            &title,
             "No tasks. Start a build or push; it appears here automatically.",
         );
         return;
     }
 
-    let items = app
+    let rows = app
         .tasks
         .iter()
         .enumerate()
         .map(|(index, task)| {
             let selected = index == app.selected_task;
-            let style = if selected {
+
+            // Status keeps its own color in both states so a running/done/
+            // failed task is identifiable at a glance even when highlighted.
+            let (status_label, status_fg) = match task.status {
+                crate::app::TaskStatus::Running => ("running", Color::Cyan),
+                crate::app::TaskStatus::Succeeded => ("done", Color::Green),
+                crate::app::TaskStatus::Failed => ("failed", Color::Red),
+            };
+
+            let row_style = if selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::LightYellow)
@@ -285,24 +297,33 @@ fn render_task_list(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            let status_style = match task.status {
-                crate::app::TaskStatus::Running => Style::default().fg(Color::Cyan),
-                crate::app::TaskStatus::Succeeded => Style::default().fg(Color::Green),
-                crate::app::TaskStatus::Failed => Style::default().fg(Color::Red),
-            };
-
-            let line = Line::from(vec![
-                Span::styled(format!("{:<6}", task.kind.label()), style),
-                Span::styled(format!("{:<8}", task.status.label()), status_style),
-                Span::styled(task.title.as_str(), style),
-            ]);
-
-            ListItem::new(line).style(style)
+            Row::new(vec![
+                Cell::from(task.kind.label()),
+                Cell::from(status_label).style(Style::default().fg(status_fg)),
+                Cell::from(task.title.as_str()),
+            ])
+            .style(row_style)
         })
         .collect::<Vec<_>>();
 
-    let list = List::new(items).block(Block::default().title("Tasks").borders(Borders::ALL));
-    frame.render_widget(list, area);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Min(15),
+        ],
+    )
+    .header(
+        Row::new(vec!["Kind", "Status", "Task"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(Block::default().title(title).borders(Borders::ALL));
+
+    frame.render_widget(table, area);
 }
 
 fn render_task_output(frame: &mut Frame, area: Rect, app: &App) {
@@ -319,12 +340,29 @@ fn render_task_output(frame: &mut Frame, area: Rect, app: &App) {
     let start = task.lines.len().saturating_sub(height);
     let visible = &task.lines[start..];
 
-    let title = format!("Output - {} [{}]", task.title, task.status.label());
+    // Color the status in the title so the selected task's state is obvious
+    // without scanning the list.
+    let status_fg = match task.status {
+        crate::app::TaskStatus::Running => Color::Cyan,
+        crate::app::TaskStatus::Succeeded => Color::Green,
+        crate::app::TaskStatus::Failed => Color::Red,
+    };
+    let title = Line::from(vec![
+        Span::raw("Output: "),
+        Span::styled(task.title.as_str(), Style::default().fg(Color::Cyan)),
+        Span::raw(" ["),
+        Span::styled(task.status.label(), Style::default().fg(status_fg)),
+        Span::raw("]"),
+    ]);
 
     // Build a Text from the line slice directly instead of joining into a
     // fresh String every frame (avoids an O(n) allocation per render).
     let text = if visible.is_empty() {
-        Text::from("No output yet.")
+        Text::from(if task.is_running() {
+            "Waiting for output..."
+        } else {
+            "No output captured."
+        })
     } else {
         visible
             .iter()
