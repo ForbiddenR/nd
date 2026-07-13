@@ -19,7 +19,7 @@ cancelled.
 Install the latest prebuilt Linux binary to `/usr/local/bin`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ForbiddenR/nd/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ForbiddenR/nd/rs/install.sh | bash
 ```
 
 The script resolves the latest release tag, downloads the matching asset for
