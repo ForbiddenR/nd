@@ -16,6 +16,18 @@ cancelled.
 
 ## Installation
 
+Install the latest prebuilt Linux binary to `/usr/local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ForbiddenR/nd/main/install.sh | bash
+```
+
+The script resolves the latest release tag, downloads the matching asset for
+your architecture, and installs `nd` to `/usr/local/bin/nd` (re-running with
+`sudo` automatically if that directory isn't writable).
+
+Or build from source:
+
 ```sh
 cargo install --path .
 ```
