@@ -52,8 +52,7 @@ where
     app.refresh();
 
     while !app.should_quit {
-        app.poll_build_events();
-        app.poll_push_events();
+        app.poll_task_events();
         app.poll_refresh_events();
         app.poll_action_events();
         terminal.draw(|frame| ui(frame, app))?;
@@ -102,9 +101,8 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('1') => app.set_screen(Screen::Containers),
         KeyCode::Char('2') => app.set_screen(Screen::Images),
         KeyCode::Char('3') => app.set_screen(Screen::Build),
-        KeyCode::Char('4') => app.set_screen(Screen::BuildStatus),
-        KeyCode::Char('5') => app.set_screen(Screen::PushStatus),
-        KeyCode::Char('6') => app.set_screen(Screen::Logs),
+        KeyCode::Char('4') => app.set_screen(Screen::Tasks),
+        KeyCode::Char('5') => app.set_screen(Screen::Logs),
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Char('s') if app.screen == Screen::Containers => {
@@ -144,11 +142,10 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             app.input.clear();
             app.set_status("build path cleared");
         }
-        KeyCode::Char('c') if app.screen == Screen::BuildStatus => app.clear_build_lines(),
-        KeyCode::Char('c') if app.screen == Screen::PushStatus => app.clear_push_lines(),
+        KeyCode::Char('c') if app.screen == Screen::Tasks => app.clear_selected_task_lines(),
         KeyCode::Char('c') if app.screen == Screen::Logs => app.clear_logs(),
-        KeyCode::Esc if app.screen == Screen::BuildStatus => app.cancel_build(),
-        KeyCode::Esc if app.screen == Screen::PushStatus => app.cancel_push(),
+        KeyCode::Char('d') if app.screen == Screen::Tasks => app.delete_selected_task(),
+        KeyCode::Esc if app.screen == Screen::Tasks => app.cancel_selected_task(),
         KeyCode::Char(character) if app.screen == Screen::Build => {
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
                 app.input.push(character);
@@ -207,28 +204,19 @@ fn run_build(app: &mut App) {
         return;
     }
 
-    if app.build_state.running {
-        app.set_error("a build is already running");
-        return;
-    }
-
     let tag = app.selected_config().and_then(|config| config.tag.clone());
 
-    match docker::build_image_stream(path, tag) {
+    match docker::build_image_stream(path.clone(), tag.clone()) {
         Ok((receiver, cancel)) => {
-            app.start_build(receiver, cancel);
-            app.set_screen(Screen::BuildStatus);
+            let title = tag.unwrap_or_else(|| format!("build {path}"));
+            app.start_build(receiver, cancel, title);
+            app.set_screen(Screen::Tasks);
         }
         Err(err) => app.set_error(err),
     }
 }
 
 fn run_push(app: &mut App) {
-    if app.push_state.running {
-        app.set_error("a push is already running");
-        return;
-    }
-
     let Some((repo, tag)) = app
         .selected_image()
         .map(|image| (image.repository.clone(), image.tag.clone()))
@@ -237,9 +225,10 @@ fn run_push(app: &mut App) {
         return;
     };
 
-    match docker::push_image_stream(repo, tag) {
+    match docker::push_image_stream(repo.clone(), tag.clone()) {
         Ok((receiver, cancel)) => {
-            app.start_push(receiver, cancel);
+            let title = format!("{repo}:{tag}");
+            app.start_push(receiver, cancel, title);
         }
         Err(err) => app.set_error(err),
     }

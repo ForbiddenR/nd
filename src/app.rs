@@ -10,8 +10,7 @@ pub enum Screen {
     Containers,
     Images,
     Build,
-    BuildStatus,
-    PushStatus,
+    Tasks,
     Logs,
 }
 
@@ -21,9 +20,8 @@ impl Screen {
             Self::Containers => 0,
             Self::Images => 1,
             Self::Build => 2,
-            Self::BuildStatus => 3,
-            Self::PushStatus => 4,
-            Self::Logs => 5,
+            Self::Tasks => 3,
+            Self::Logs => 4,
         }
     }
 
@@ -31,9 +29,8 @@ impl Screen {
         match self {
             Self::Containers => Self::Images,
             Self::Images => Self::Build,
-            Self::Build => Self::BuildStatus,
-            Self::BuildStatus => Self::PushStatus,
-            Self::PushStatus => Self::Logs,
+            Self::Build => Self::Tasks,
+            Self::Tasks => Self::Logs,
             Self::Logs => Self::Containers,
         }
     }
@@ -43,9 +40,8 @@ impl Screen {
             Self::Containers => Self::Logs,
             Self::Images => Self::Containers,
             Self::Build => Self::Images,
-            Self::BuildStatus => Self::Build,
-            Self::PushStatus => Self::BuildStatus,
-            Self::Logs => Self::PushStatus,
+            Self::Tasks => Self::Build,
+            Self::Logs => Self::Tasks,
         }
     }
 }
@@ -78,22 +74,59 @@ pub struct Image {
     pub size: String,
 }
 
-/// Shared state for a streaming nerdctl operation (build, push, etc.).
-/// Owns the output lines, running flag, and event receiver so the caller
-/// doesn't need to duplicate this triple for each operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Build,
+    Push,
+}
+
+impl TaskKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Push => "push",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// A backgrounded streaming nerdctl operation (build or push) shown on the
+/// Tasks screen. Owns its output lines, status, event receiver, and cancel
+/// handle. Multiple tasks can run at once; each is drained every tick by
+/// `poll_task_events`.
 #[derive(Debug)]
-pub struct ProgressState {
+pub struct Task {
+    pub kind: TaskKind,
+    pub title: String,
+    pub status: TaskStatus,
     pub lines: Vec<String>,
-    pub running: bool,
     events: Option<Receiver<docker::ProgressEvent>>,
     cancel: Option<docker::CancelHandle>,
 }
 
-impl ProgressState {
-    pub fn new() -> Self {
+impl Task {
+    pub fn new(kind: TaskKind, title: String) -> Self {
         Self {
+            kind,
+            title,
+            status: TaskStatus::Running,
             lines: Vec::new(),
-            running: false,
             events: None,
             cancel: None,
         }
@@ -107,7 +140,11 @@ impl ProgressState {
         self.lines.clear();
         self.events = Some(receiver);
         self.cancel = Some(cancel);
-        self.running = true;
+        self.status = TaskStatus::Running;
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status == TaskStatus::Running
     }
 
     /// Drain all buffered events without blocking. Returns an empty vec when
@@ -123,10 +160,14 @@ impl ProgressState {
         events
     }
 
-    /// Called when a Finished event arrives. Clears the running flag and
+    /// Called when a Finished event arrives. Records the final status and
     /// drops the receiver and cancel handle.
-    pub fn handle_finished(&mut self) {
-        self.running = false;
+    pub fn handle_finished(&mut self, success: bool) {
+        self.status = if success {
+            TaskStatus::Succeeded
+        } else {
+            TaskStatus::Failed
+        };
         self.events = None;
         self.cancel = None;
     }
@@ -142,25 +183,25 @@ impl ProgressState {
 
     /// Clear output lines if not running. Returns true if cleared.
     pub fn clear_lines(&mut self) -> bool {
-        if self.running {
+        if self.is_running() {
             return false;
         }
         self.lines.clear();
         true
     }
 
-    /// Append a line with a bounded cap. Public so the poll helpers on App
-    /// can call it directly.
-    pub fn push_line(lines: &mut Vec<String>, line: String) {
+    /// Append a line with a bounded cap so a very verbose build/push can't
+    /// grow the buffer without limit.
+    pub fn push_line(&mut self, line: String) {
         if line.trim().is_empty() {
             return;
         }
 
-        lines.push(line);
+        self.lines.push(line);
 
-        if lines.len() > 2_000 {
-            let remove_count = lines.len() - 2_000;
-            lines.drain(0..remove_count);
+        if self.lines.len() > 2_000 {
+            let remove_count = self.lines.len() - 2_000;
+            self.lines.drain(0..remove_count);
         }
     }
 }
@@ -204,8 +245,8 @@ pub struct App {
     pub logs: Vec<String>,
     pub input: String,
     pub configs: Vec<config::Config>,
-    pub build_state: ProgressState,
-    pub push_state: ProgressState,
+    pub tasks: Vec<Task>,
+    pub selected_task: usize,
     refresh_events: Option<Receiver<RefreshEvent>>,
     refresh_pending: bool,
     action_events: Option<Receiver<ActionEvent>>,
@@ -226,8 +267,8 @@ impl App {
             logs: Vec::new(),
             input: String::new(),
             configs: vec![],
-            build_state: ProgressState::new(),
-            push_state: ProgressState::new(),
+            tasks: Vec::new(),
+            selected_task: 0,
             refresh_events: None,
             refresh_pending: false,
             action_events: None,
@@ -389,6 +430,9 @@ impl App {
             Screen::Build if !self.configs.is_empty() => {
                 self.selected_build_tag = self.selected_build_tag.saturating_sub(1);
             }
+            Screen::Tasks if !self.tasks.is_empty() => {
+                self.selected_task = self.selected_task.saturating_sub(1);
+            }
             _ => {}
         }
     }
@@ -406,6 +450,10 @@ impl App {
             Screen::Build if !self.configs.is_empty() => {
                 self.selected_build_tag =
                     (self.selected_build_tag + 1).min(self.configs.len().saturating_sub(1));
+            }
+            Screen::Tasks if !self.tasks.is_empty() => {
+                self.selected_task =
+                    (self.selected_task + 1).min(self.tasks.len().saturating_sub(1));
             }
             _ => {}
         }
@@ -435,6 +483,10 @@ impl App {
         self.configs.get(self.selected_build_tag)
     }
 
+    pub fn selected_task(&self) -> Option<&Task> {
+        self.tasks.get(self.selected_task)
+    }
+
     pub fn open_modal(&mut self, modal: Modal) {
         self.modal = Some(modal);
     }
@@ -443,16 +495,17 @@ impl App {
         self.modal = None;
     }
 
-    /// Returns true if a build or push is still running in the background.
+    /// Returns true if any task is still running in the background.
     pub fn has_running_tasks(&self) -> bool {
-        self.build_state.running || self.push_state.running
+        self.tasks.iter().any(|task| task.is_running())
     }
 
-    /// Kill any running build/push children so they don't survive the TUI as
-    /// orphaned `nerdctl` processes. Called on quit.
+    /// Kill any running tasks so they don't survive the TUI as orphaned
+    /// `nerdctl` processes. Called on quit.
     pub fn cancel_running_tasks(&mut self) {
-        self.build_state.cancel();
-        self.push_state.cancel();
+        for task in &mut self.tasks {
+            task.cancel();
+        }
     }
 
     pub fn push_log(&mut self, message: impl Into<String>) {
@@ -476,87 +529,108 @@ impl App {
         self.status = "logs cleared".to_string();
     }
 
+    /// Start a build task and select it on the Tasks screen.
     pub fn start_build(
         &mut self,
         receiver: Receiver<docker::ProgressEvent>,
         cancel: docker::CancelHandle,
+        title: String,
     ) {
-        self.build_state.start(receiver, cancel);
+        self.start_task(TaskKind::Build, receiver, cancel, title);
         self.status = "build started".to_string();
     }
 
-    pub fn cancel_build(&mut self) {
-        if self.build_state.running {
-            self.build_state.cancel();
-            self.status = "cancelling build...".to_string();
-        }
-    }
-
-    pub fn poll_build_events(&mut self) {
-        for event in self.build_state.drain_events() {
-            match event {
-                docker::ProgressEvent::Line(line) => {
-                    ProgressState::push_line(&mut self.build_state.lines, line);
-                }
-                docker::ProgressEvent::Finished { success, message } => {
-                    ProgressState::push_line(&mut self.build_state.lines, message.clone());
-                    self.build_state.handle_finished();
-                    if success {
-                        self.status = "build completed".to_string();
-                        self.refresh();
-                    } else {
-                        self.set_error(message);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn clear_build_lines(&mut self) {
-        if self.build_state.clear_lines() {
-            self.status = "build status cleared".to_string();
-        }
-    }
-
+    /// Start a push task and select it on the Tasks screen.
     pub fn start_push(
         &mut self,
         receiver: Receiver<docker::ProgressEvent>,
         cancel: docker::CancelHandle,
+        title: String,
     ) {
-        self.push_state.start(receiver, cancel);
+        self.start_task(TaskKind::Push, receiver, cancel, title);
         self.status = "push started".to_string();
     }
 
-    pub fn cancel_push(&mut self) {
-        if self.push_state.running {
-            self.push_state.cancel();
-            self.status = "cancelling push...".to_string();
-        }
+    fn start_task(
+        &mut self,
+        kind: TaskKind,
+        receiver: Receiver<docker::ProgressEvent>,
+        cancel: docker::CancelHandle,
+        title: String,
+    ) {
+        let mut task = Task::new(kind, title);
+        task.start(receiver, cancel);
+        self.tasks.push(task);
+        // Select the newly started task so its output is visible immediately.
+        self.selected_task = self.tasks.len() - 1;
     }
 
-    pub fn poll_push_events(&mut self) {
-        for event in self.push_state.drain_events() {
-            match event {
-                docker::ProgressEvent::Line(line) => {
-                    ProgressState::push_line(&mut self.push_state.lines, line);
-                }
-                docker::ProgressEvent::Finished { success, message } => {
-                    ProgressState::push_line(&mut self.push_state.lines, message.clone());
-                    self.push_state.handle_finished();
-                    if success {
-                        self.status = "push completed".to_string();
-                        self.refresh();
-                    } else {
-                        self.set_error(message);
+    /// Drain events from every task and apply results. Called each tick from
+    /// the main loop so streaming output updates without blocking. Events are
+    /// drained into per-task buffers first so applying a Finished result (which
+    /// may call `self.refresh` / `self.set_error`) doesn't conflict with the
+    /// borrow used to drain.
+    pub fn poll_task_events(&mut self) {
+        let mut drained: Vec<(usize, Vec<docker::ProgressEvent>)> = Vec::new();
+        for (index, task) in self.tasks.iter_mut().enumerate() {
+            let events = task.drain_events();
+            if !events.is_empty() {
+                drained.push((index, events));
+            }
+        }
+
+        for (index, events) in drained {
+            for event in events {
+                match event {
+                    docker::ProgressEvent::Line(line) => self.tasks[index].push_line(line),
+                    docker::ProgressEvent::Finished { success, message } => {
+                        self.tasks[index].push_line(message.clone());
+                        self.tasks[index].handle_finished(success);
+                        if success {
+                            self.status = format!("{} completed", self.tasks[index].kind.label());
+                            self.refresh();
+                        } else {
+                            self.set_error(message);
+                        }
                     }
                 }
             }
         }
     }
 
-    pub fn clear_push_lines(&mut self) {
-        if self.push_state.clear_lines() {
-            self.status = "push status cleared".to_string();
+    /// Cancel the selected task if it is still running.
+    pub fn cancel_selected_task(&mut self) {
+        if let Some(task) = self.tasks.get_mut(self.selected_task)
+            && task.is_running()
+        {
+            task.cancel();
+            self.status = "cancelling task...".to_string();
+        }
+    }
+
+    /// Remove the selected task from the list. A still-running task is
+    /// cancelled first so its child process isn't orphaned - dropping a
+    /// `CancelHandle` does nothing on its own, only `cancel` sends the signal.
+    pub fn delete_selected_task(&mut self) {
+        if self.tasks.is_empty() {
+            return;
+        }
+
+        let index = self.selected_task.min(self.tasks.len() - 1);
+        if self.tasks[index].is_running() {
+            self.tasks[index].cancel();
+        }
+        self.tasks.remove(index);
+        self.clamp_task_selection();
+        self.status = "task removed".to_string();
+    }
+
+    /// Clear the selected task's output lines, if it has finished.
+    pub fn clear_selected_task_lines(&mut self) {
+        if let Some(task) = self.tasks.get_mut(self.selected_task)
+            && task.clear_lines()
+        {
+            self.status = "task output cleared".to_string();
         }
     }
 
@@ -595,6 +669,14 @@ impl App {
             self.selected_build_tag = self
                 .selected_build_tag
                 .min(self.configs.len().saturating_sub(1));
+        }
+    }
+
+    fn clamp_task_selection(&mut self) {
+        if self.tasks.is_empty() {
+            self.selected_task = 0;
+        } else {
+            self.selected_task = self.selected_task.min(self.tasks.len() - 1);
         }
     }
 }

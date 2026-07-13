@@ -1,0 +1,49 @@
+name: release
+
+# Build an optimized Linux binary whenever a release is published (i.e. when a
+# git tag like v0.1.0 is pushed with a GitHub Release attached), then upload
+# the binary to that release as a downloadable asset.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # needed to upload assets to the release
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Release profile from Cargo.toml (lto, opt-level=s, strip) is applied
+      # automatically by --release.
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package the binary
+        run: |
+          # Bundle the binary with a copy of the README and LICENSE so the
+          # downloaded asset is self-contained, and name it for the platform
+          # so multiple OS releases can coexist.
+          tag="${GITHUB_REF_NAME}"
+          staging="nd-${tag}-x86_64-unknown-linux-gnu"
+          mkdir "$staging"
+          cp target/release/nd "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          echo "asset=${staging}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload asset to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" "${asset}" --clobber

@@ -9,8 +9,7 @@ use ratatui::{
 use crate::{
     app::{App, Modal, Screen},
     consts::{
-        HELP_BUILD, HELP_BUILD_STATUS, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL,
-        HELP_PUSH_STATUS, SIDEBAR_ITEMS,
+        HELP_BUILD, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL, HELP_TASKS, SIDEBAR_ITEMS,
     },
 };
 pub fn ui(frame: &mut Frame, app: &App) {
@@ -89,20 +88,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Containers => render_containers(frame, area, app),
         Screen::Images => render_images(frame, area, app),
         Screen::Build => render_build(frame, area, app),
-        Screen::BuildStatus => render_progress_status(
-            frame,
-            area,
-            &app.build_state,
-            "Build Status",
-            "No build output yet. Start a build from the Build page.",
-        ),
-        Screen::PushStatus => render_progress_status(
-            frame,
-            area,
-            &app.push_state,
-            "Push Status",
-            "No push output yet. Start a push from the Images page.",
-        ),
+        Screen::Tasks => render_tasks(frame, area, app),
         Screen::Logs => render_logs(frame, area, app),
     }
 }
@@ -261,28 +247,84 @@ fn render_build(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
-fn render_progress_status(
-    frame: &mut Frame,
-    area: Rect,
-    state: &crate::app::ProgressState,
-    title: &str,
-    empty_message: &str,
-) {
+fn render_tasks(frame: &mut Frame, area: Rect, app: &App) {
+    // Split the Tasks screen into a left list of tasks and a right pane
+    // showing the selected task's streaming output.
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(34), Constraint::Min(20)])
+        .split(area);
+
+    render_task_list(frame, chunks[0], app);
+    render_task_output(frame, chunks[1], app);
+}
+
+fn render_task_list(frame: &mut Frame, area: Rect, app: &App) {
+    if app.tasks.is_empty() {
+        render_empty(
+            frame,
+            area,
+            "Tasks",
+            "No tasks. Start a build or push; it appears here automatically.",
+        );
+        return;
+    }
+
+    let items = app
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let selected = index == app.selected_task;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightYellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let status_style = match task.status {
+                crate::app::TaskStatus::Running => Style::default().fg(Color::Cyan),
+                crate::app::TaskStatus::Succeeded => Style::default().fg(Color::Green),
+                crate::app::TaskStatus::Failed => Style::default().fg(Color::Red),
+            };
+
+            let line = Line::from(vec![
+                Span::styled(format!("{:<6}", task.kind.label()), style),
+                Span::styled(format!("{:<8}", task.status.label()), status_style),
+                Span::styled(task.title.as_str(), style),
+            ]);
+
+            ListItem::new(line).style(style)
+        })
+        .collect::<Vec<_>>();
+
+    let list = List::new(items).block(Block::default().title("Tasks").borders(Borders::ALL));
+    frame.render_widget(list, area);
+}
+
+fn render_task_output(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(task) = app.selected_task() else {
+        let widget = Paragraph::new("No task selected.")
+            .block(Block::default().title("Output").borders(Borders::ALL))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, area);
+        return;
+    };
+
     // Show only the lines that fit in the visible area, tailing the newest.
     let height = area.height.saturating_sub(2) as usize;
-    let start = state.lines.len().saturating_sub(height);
-    let visible = &state.lines[start..];
+    let start = task.lines.len().saturating_sub(height);
+    let visible = &task.lines[start..];
 
-    let title = if state.running {
-        format!("{title} (running)")
-    } else {
-        title.to_string()
-    };
+    let title = format!("Output - {} [{}]", task.title, task.status.label());
 
     // Build a Text from the line slice directly instead of joining into a
     // fresh String every frame (avoids an O(n) allocation per render).
     let text = if visible.is_empty() {
-        Text::from(empty_message)
+        Text::from("No output yet.")
     } else {
         visible
             .iter()
@@ -290,11 +332,11 @@ fn render_progress_status(
             .collect()
     };
 
-    let status = Paragraph::new(text)
+    let widget = Paragraph::new(text)
         .block(Block::default().title(title).borders(Borders::ALL))
         .wrap(Wrap { trim: false });
 
-    frame.render_widget(status, area);
+    frame.render_widget(widget, area);
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, app: &App) {
@@ -365,24 +407,24 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 )
             })
             .unwrap_or_else(|| "No build config selected.".to_string()),
-        Screen::BuildStatus => format!(
-            "Build status\n{}\n\n{} output lines",
-            if app.build_state.running {
-                "Running"
-            } else {
-                "Idle"
-            },
-            app.build_state.lines.len()
-        ),
-        Screen::PushStatus => format!(
-            "Push status\n{}\n\n{} output lines",
-            if app.push_state.running {
-                "Running"
-            } else {
-                "Idle"
-            },
-            app.push_state.lines.len()
-        ),
+        Screen::Tasks => {
+            let running = app.tasks.iter().filter(|task| task.is_running()).count();
+            let total = app.tasks.len();
+            let selected = app
+                .selected_task()
+                .map(|task| {
+                    format!(
+                        "{} [{}]\n{} output lines",
+                        task.title,
+                        task.status.label(),
+                        task.lines.len()
+                    )
+                })
+                .unwrap_or_else(|| "No task selected.".to_string());
+            format!(
+                "Tasks\n{running} running, {total} total\n\nSelected\n{selected}"
+            )
+        }
         Screen::Logs => format!("{} log lines", app.logs.len()),
     };
 
@@ -390,8 +432,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Containers => HELP_CONTAINERS,
         Screen::Images => HELP_IMAGES,
         Screen::Build => HELP_BUILD,
-        Screen::BuildStatus => HELP_BUILD_STATUS,
-        Screen::PushStatus => HELP_PUSH_STATUS,
+        Screen::Tasks => HELP_TASKS,
         Screen::Logs => HELP_LOGS,
     };
 
@@ -460,11 +501,11 @@ fn render_modal(frame: &mut Frame, app: &App) {
             HELP_MODAL,
         ),
         Modal::ConfirmQuit => {
-            let body = match (app.build_state.running, app.push_state.running) {
-                (true, true) => "A build and a push are still running. Quit anyway?".to_string(),
-                (true, false) => "A build is still running. Quit anyway?".to_string(),
-                (false, true) => "A push is still running. Quit anyway?".to_string(),
-                (false, false) => "Quit?".to_string(),
+            let running = app.tasks.iter().filter(|task| task.is_running()).count();
+            let body = match running {
+                0 => "Quit?".to_string(),
+                1 => "A task is still running. Quit anyway?".to_string(),
+                n => format!("{n} tasks are still running. Quit anyway?"),
             };
             ("Quit", body, HELP_MODAL)
         }

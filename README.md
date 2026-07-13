@@ -5,7 +5,9 @@ A terminal UI for managing [nerdctl] containers, images, and builds.
 `nd` is a small [Ratatui] app that wraps common `nerdctl` operations - listing,
 starting/stopping/removing containers and images, building and pushing images -
 behind a keyboard-driven interface. Long-running operations (build, push,
-refresh, prune) run in the background so the UI never blocks.
+refresh, prune) run in the background so the UI never blocks, and each build or
+push becomes a task on the Tasks screen where it can be inspected or
+cancelled.
 
 ## Requirements
 
@@ -43,13 +45,12 @@ Resolved tags are offered as a selectable list on the Build screen.
 | Containers | `r` refresh · `tab` switch screen · `↑/↓` select · `s` start · `x` stop · `R` restart · `d` remove · `p` system prune |
 | Images | `r` refresh · `tab` switch · `↑/↓` select · `d` remove · `p` prune images · `s` push |
 | Build | `r` reload config · `tab` switch · type path · `enter` build · `backspace` delete · `ctrl-u` clear · `p` prune builder |
-| Build Status | `tab` switch · `c` clear output · `esc` cancel running build |
-| Push Status | `tab` switch · `c` clear output · `esc` cancel running push |
+| Tasks | `tab` switch · `↑/↓` select task · `d` remove task (cancels if running) · `c` clear finished output · `esc` cancel running task |
 | Logs | `r` refresh · `tab` switch · `c` clear logs |
 
-Global: `1`-`6` jump to a screen · `tab`/`shift-tab` cycle · `q` quit (confirms
-if a build or push is still running) · `ctrl-c` force quit (kills running
-build/push processes).
+Global: `1`-`5` jump to a screen · `tab`/`shift-tab` cycle · `q` quit (confirms
+if a task is still running) · `ctrl-c` force quit (kills running task
+processes).
 
 ## License
 
