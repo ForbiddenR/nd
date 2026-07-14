@@ -1,5 +1,6 @@
 use std::{
     io::Read,
+    path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
@@ -102,6 +103,7 @@ pub fn build_image_stream(
         command.args(["-t", tag]);
     }
 
+    command.arg("-f").arg(Path::new(&path).join("Dockerfile"));
     command.arg(path);
 
     spawn_docker_stream(

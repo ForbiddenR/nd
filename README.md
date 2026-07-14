@@ -61,9 +61,10 @@ it, `esc` to cancel, or `ctrl-u` to empty the draft. Saving an empty draft clear
 the override and returns to the configured/default context. Manual overrides
 last only for the current `nd` process.
 
-Relative contexts are resolved from the directory where `nd` was launched. The
-context is passed directly to `nerdctl` as one argument, so spaces are supported
-but shell expansion such as `~`, `$VAR`, or `*` is not performed.
+Relative contexts are resolved from the directory where `nd` was launched. Each
+build context must contain a file named `Dockerfile`; `nd` passes that file to
+`nerdctl` with `-f` and passes the context as one argument, so spaces are
+supported but shell expansion such as `~`, `$VAR`, or `*` is not performed.
 
 Resolved tags and contexts are offered as a selectable list on the Build screen.
 
