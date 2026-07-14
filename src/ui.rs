@@ -190,89 +190,168 @@ fn render_images(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(table, area);
 }
 
-fn render_build(frame: &mut Frame, area: Rect, app: &App) {
-    let mut text = vec![
-        Line::from("Build an image with nerdctl from a local context."),
-        Line::from(""),
-    ];
+const BUILD_WIDE_BREAKPOINT: u16 = 80;
 
-    if app.editing_context {
+fn render_build(frame: &mut Frame, area: Rect, app: &App) {
+    let (direction, constraints) = if area.width >= BUILD_WIDE_BREAKPOINT {
+        (
+            Direction::Horizontal,
+            [Constraint::Percentage(44), Constraint::Percentage(56)],
+        )
+    } else {
+        let target_height = (area.height.saturating_mul(2) / 5)
+            .max(4)
+            .min(area.height.saturating_sub(3));
+        (
+            Direction::Vertical,
+            [Constraint::Length(target_height), Constraint::Min(3)],
+        )
+    };
+
+    let chunks = Layout::default()
+        .direction(direction)
+        .constraints(constraints)
+        .split(area);
+
+    render_build_targets(frame, chunks[0], app);
+    render_build_plan(frame, chunks[1], app);
+}
+
+fn render_build_targets(frame: &mut Frame, area: Rect, app: &App) {
+    if app.configs.is_empty() {
+        render_empty(
+            frame,
+            area,
+            "Build targets · 0",
+            "No configured builds. Use the default context or edit an override.",
+        );
+        return;
+    }
+
+    let visible =
+        visible_build_config_range(app.configs.len(), app.selected_build_tag, area.height);
+    let start = visible.start;
+    let rows = app.configs[visible]
+        .iter()
+        .enumerate()
+        .map(|(offset, config)| {
+            let selected = start + offset == app.selected_build_tag;
+            let marker = if selected { "›" } else { " " };
+            let tag = config.tag.as_deref().unwrap_or("<no tag resolved>");
+            let version = config.latest_version.as_deref().unwrap_or("<not resolved>");
+
+            Row::new(vec![
+                Cell::from(format!("{marker} {tag}")),
+                Cell::from(config.context_or_default()),
+                Cell::from(version),
+            ])
+            .style(selected_style(selected))
+        })
+        .collect::<Vec<_>>();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(46),
+            Constraint::Percentage(34),
+            Constraint::Min(8),
+        ],
+    )
+    .header(
+        Row::new(vec!["Tag", "Context", "Latest"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(
+        Block::default()
+            .title(format!("Build targets · {}", app.configs.len()))
+            .borders(Borders::ALL),
+    );
+
+    frame.render_widget(table, area);
+}
+
+fn render_build_plan(frame: &mut Frame, area: Rect, app: &App) {
+    let title = if app.editing_context {
+        "Edit context"
+    } else {
+        "Build plan"
+    };
+    let label_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let selected_config = app.selected_config();
+    let config_position = selected_config
+        .map(|_| format!("{}/{}", app.selected_build_tag + 1, app.configs.len()))
+        .unwrap_or_else(|| "none".to_string());
+    let configured_context = selected_config
+        .map(|config| config.context_or_default())
+        .unwrap_or("<none>");
+    let tag = selected_config
+        .and_then(|config| config.tag.as_deref())
+        .unwrap_or("<no tag resolved>");
+    let version = selected_config
+        .and_then(|config| config.latest_version.as_deref())
+        .unwrap_or("<not resolved>");
+
+    let target = Line::from(vec![
+        Span::styled("Config · ", label_style),
+        Span::styled(config_position, value_style),
+        Span::styled(" · Tag · ", label_style),
+        Span::styled(tag, value_style),
+    ]);
+    let configured = Line::from(vec![
+        Span::styled("Configured context · ", label_style),
+        Span::styled(configured_context, value_style),
+    ]);
+    let latest = Line::from(vec![
+        Span::styled("Latest · ", label_style),
+        Span::styled(version, value_style),
+    ]);
+
+    let text = if app.editing_context {
         let draft = if app.context_draft().is_empty() {
             "<empty — save to clear override>"
         } else {
             app.context_draft()
         };
-        text.extend([
-            Line::from(vec![
-                Span::styled("Editing context: ", Style::default().fg(Color::Yellow)),
-                Span::styled(draft, Style::default().fg(Color::Cyan)),
-            ]),
-            Line::from("Enter saves · Esc cancels · Backspace deletes · Ctrl-U clears"),
-        ]);
-    } else {
-        text.extend([
-            Line::from(vec![
-                Span::styled("Context: ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    app.effective_build_context(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Source: ", Style::default().fg(Color::Yellow)),
-                Span::raw(app.build_context_source().label()),
-            ]),
-        ]);
-    }
-
-    text.extend([Line::from(""), Line::from("Configured builds:")]);
-
-    if app.configs.is_empty() {
-        text.push(Line::from("  <no configs in nd.toml — using context .>"));
-    } else {
-        for (index, config) in app.configs.iter().enumerate() {
-            let marker = if index == app.selected_build_tag {
-                ">"
-            } else {
-                " "
-            };
-            let tag = config.tag.as_deref().unwrap_or("<no tag resolved>");
-            let version = config.latest_version.as_deref().unwrap_or("<not resolved>");
-            let style = if index == app.selected_build_tag {
-                Style::default().fg(Color::Black).bg(Color::LightYellow)
-            } else {
-                Style::default()
-            };
-
-            text.push(Line::styled(
-                format!(
-                    "{marker} {tag} | context: {} | latest: {version}",
-                    config.context_or_default()
-                ),
-                style,
-            ));
-        }
-    }
-
-    if app.editing_context {
-        text.extend([
+        vec![
+            Line::from(Span::styled("Draft context", label_style)),
+            Line::from(Span::styled(draft, value_style)),
+            Line::from("Enter save · Esc cancel"),
+            Line::from("Backspace delete · Ctrl-U clear"),
             Line::from(""),
-            Line::from("Save or cancel the draft to return to build controls."),
-        ]);
+            Line::from(vec![
+                Span::styled("Current · ", label_style),
+                Span::styled(app.effective_build_context(), value_style),
+            ]),
+            Line::from(format!("Source · {}", app.build_context_source().label())),
+            target,
+            configured,
+            latest,
+        ]
     } else {
-        text.extend([
+        vec![
+            Line::from(Span::styled("Effective context", label_style)),
+            Line::from(Span::styled(app.effective_build_context(), value_style)),
+            Line::from(format!("Source · {}", app.build_context_source().label())),
+            Line::from("↑/↓ select target · Enter build"),
+            Line::from("e edit context · p prune builder"),
             Line::from(""),
-            Line::from("Use ↑/↓ to select a configured build."),
-            Line::from("Press e to edit a one-off context override."),
-            Line::from("Press Enter to build with the effective context."),
-        ]);
-    }
+            target,
+            configured,
+            latest,
+        ]
+    };
 
     let widget = Paragraph::new(text)
-        .block(Block::default().title("Build").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
 
     frame.render_widget(widget, area);
 }
@@ -450,20 +529,43 @@ fn task_list_title(app: &App) -> Line<'static> {
     ])
 }
 
+fn visible_build_config_range(
+    config_count: usize,
+    selected_config: usize,
+    area_height: u16,
+) -> std::ops::Range<usize> {
+    visible_selected_range(
+        config_count,
+        selected_config,
+        area_height.saturating_sub(3) as usize,
+    )
+}
+
 fn visible_task_range(
     task_count: usize,
     selected_task: usize,
     area_height: u16,
 ) -> std::ops::Range<usize> {
-    let capacity = area_height.saturating_sub(3) as usize;
-    if task_count <= capacity || capacity == 0 {
-        return 0..task_count.min(capacity);
+    visible_selected_range(
+        task_count,
+        selected_task,
+        area_height.saturating_sub(3) as usize,
+    )
+}
+
+fn visible_selected_range(
+    item_count: usize,
+    selected_item: usize,
+    capacity: usize,
+) -> std::ops::Range<usize> {
+    if item_count <= capacity || capacity == 0 {
+        return 0..item_count.min(capacity);
     }
 
-    let selected = selected_task.min(task_count - 1);
+    let selected = selected_item.min(item_count - 1);
     let start = selected
         .saturating_sub(capacity / 2)
-        .min(task_count - capacity);
+        .min(item_count - capacity);
     start..start + capacity
 }
 
@@ -786,6 +888,15 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn render_build_targets_buffer(width: u16, height: u16, app: &App) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_build_targets(frame, frame.area(), app))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
     fn render_app_buffer(width: u16, height: u16, app: &App) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -824,52 +935,96 @@ mod tests {
     }
 
     #[test]
-    fn build_screen_shows_default_context_without_config() {
-        let mut app = App::new();
-        app.screen = Screen::Build;
-
-        let rendered = buffer_lines(&render_app_buffer(90, 28, &app)).join("\n");
-        assert!(rendered.contains("Context: ."));
-        assert!(rendered.contains("Source: default"));
-        assert!(rendered.contains("no configs in nd.toml"));
-        assert!(rendered.contains("Context · . [default]"));
-        assert!(rendered.contains("e edit context"));
-    }
-
-    #[test]
-    fn build_screen_shows_configured_and_manual_context_sources() {
+    fn build_layout_switches_between_wide_and_narrow() {
         let mut app = App::new();
         app.configs = vec![
-            build_config(Some(" ./configured "), "example:first"),
-            build_config(None, "example:second"),
+            build_config(Some("./app"), "example:app"),
+            build_config(Some("./worker"), "example:worker"),
         ];
 
-        let configured = buffer_lines(&render_build_buffer(90, 16, &app)).join("\n");
-        assert!(configured.contains("Context: ./configured"));
-        assert!(configured.contains("Source: configured"));
-        assert!(configured.contains("example:first | context: ./configured"));
-        assert!(configured.contains("example:second | context: ."));
+        let wide = buffer_lines(&render_build_buffer(100, 16, &app));
+        assert!(wide[0].contains("Build targets · 2"));
+        assert!(wide[0].contains("Build plan"));
 
-        app.input = " ./manual path ".to_string();
-        let manual = buffer_lines(&render_build_buffer(90, 16, &app)).join("\n");
-        assert!(manual.contains("Context: ./manual path"));
-        assert!(manual.contains("Source: manual"));
+        let narrow = buffer_lines(&render_build_buffer(60, 16, &app));
+        let plan_row = narrow
+            .iter()
+            .position(|line| line.contains("Build plan"))
+            .unwrap();
+        assert!(narrow[0].contains("Build targets · 2"));
+        assert!(plan_row > 0);
     }
 
     #[test]
-    fn build_screen_distinguishes_context_edit_mode() {
+    fn build_screen_keeps_the_default_plan_available_without_config() {
         let mut app = App::new();
         app.screen = Screen::Build;
+
+        let rendered = buffer_lines(&render_app_buffer(110, 28, &app)).join("\n");
+        assert!(rendered.contains("Build targets · 0"));
+        assert!(rendered.contains("No configured builds."));
+        assert!(rendered.contains("Build plan"));
+        assert!(rendered.contains("Effective context"));
+        assert!(rendered.contains("Source · default"));
+        assert!(rendered.contains("Config · none"));
+        assert!(rendered.contains("Enter build"));
+        assert!(rendered.contains("Context · . [default]"));
+    }
+
+    #[test]
+    fn build_plan_separates_manual_and_configured_contexts() {
+        let mut app = App::new();
+        app.configs = vec![build_config(Some(" ./configured "), "example:app")];
+        app.input = " ./manual path ".to_string();
+
+        let rendered = buffer_lines(&render_build_buffer(100, 18, &app)).join("\n");
+        assert!(rendered.contains("Effective context"));
+        assert!(rendered.contains("./manual path"));
+        assert!(rendered.contains("Source · manual"));
+        assert!(rendered.contains("Configured context"));
+        assert!(rendered.contains("./configured"));
+        assert!(rendered.contains("Config · 1/1"));
+        assert!(rendered.contains("example:app"));
+    }
+
+    #[test]
+    fn selected_build_target_stays_inside_the_visible_range() {
+        let mut app = App::new();
+        app.configs = (0..10)
+            .map(|index| build_config(Some("./context"), &format!("example:{index}")))
+            .collect();
+        app.selected_build_tag = 9;
+
+        assert_eq!(visible_build_config_range(10, 9, 7), 6..10);
+
+        let buffer = render_build_targets_buffer(50, 7, &app);
+        let rendered = buffer_lines(&buffer).join("\n");
+        assert!(rendered.contains("example:9"));
+        assert!(!rendered.contains("example:0"));
+        assert_eq!(buffer.cell((1, 5)).unwrap().bg, Color::LightYellow);
+    }
+
+    #[test]
+    fn build_plan_wraps_edit_drafts_and_keeps_edit_controls_visible() {
+        let mut app = App::new();
+        app.configs = vec![build_config(Some("./configured"), "example:app")];
         app.begin_context_edit();
         app.clear_context_draft();
-        for character in "q/rp-jk12345".chars() {
+        for character in "./a-long-context-path/with-q-r-p-j-k-and-12345".chars() {
             app.push_context_char(character);
         }
 
-        let rendered = buffer_lines(&render_app_buffer(90, 28, &app)).join("\n");
-        assert!(rendered.contains("Editing context: q/rp-jk12345"));
-        assert!(rendered.contains("enter save"));
-        assert!(rendered.contains("ctrl-u clear"));
+        let rendered = buffer_lines(&render_build_buffer(60, 22, &app)).join("\n");
+        assert!(rendered.contains("Edit context"));
+        assert!(rendered.contains("Draft context"));
+        assert!(rendered.contains("a-long-context-path"));
+        assert!(rendered.contains("Enter save"));
+        assert!(rendered.contains("Backspace delete"));
+        assert!(!rendered.contains("Enter build"));
+
+        app.clear_context_draft();
+        let empty = buffer_lines(&render_build_buffer(60, 22, &app)).join("\n");
+        assert!(empty.contains("empty — save to clear override"));
     }
 
     #[test]
