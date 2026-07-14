@@ -1,6 +1,6 @@
 use std::{
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
@@ -96,6 +96,7 @@ pub fn build_image_stream(
     path: String,
     tag: Option<String>,
 ) -> Result<(Receiver<ProgressEvent>, CancelHandle)> {
+    let build_file = build_file_for_context(&path)?;
     let mut command = Command::new("nerdctl");
     command.arg("build");
 
@@ -103,14 +104,31 @@ pub fn build_image_stream(
         command.args(["-t", tag]);
     }
 
-    command.arg("-f").arg(Path::new(&path).join("Dockerfile"));
-    command.arg(path);
+    command.arg("-f").arg(build_file).arg(path);
 
     spawn_docker_stream(
         command,
         "failed to start nerdctl build",
         "build completed successfully",
         "build",
+    )
+}
+
+fn build_file_for_context(context: &str) -> Result<PathBuf> {
+    let context = Path::new(context);
+    let dockerfile = context.join("Dockerfile");
+    if dockerfile.is_file() {
+        return Ok(dockerfile);
+    }
+
+    let containerfile = context.join("Containerfile");
+    if containerfile.is_file() {
+        return Ok(containerfile);
+    }
+
+    bail!(
+        "no Dockerfile or Containerfile found in build context: {}",
+        context.display()
     )
 }
 
@@ -387,11 +405,16 @@ fn parse_image(line: &str) -> Option<Image> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::Read,
-        time::{Duration, Instant},
+        path::{Path, PathBuf},
+        time::{Duration, Instant, SystemTime},
     };
 
-    use super::{ProgressEvent, parse_container, parse_image, spawn_docker_stream, spawn_reader};
+    use super::{
+        ProgressEvent, build_file_for_context, parse_container, parse_image, spawn_docker_stream,
+        spawn_reader,
+    };
 
     /// A reader that hands back data one fixed-size chunk per `read` call,
     /// letting tests simulate multi-byte characters and lines split across
@@ -414,6 +437,33 @@ mod tests {
         }
     }
 
+    struct TempContext {
+        path: PathBuf,
+    }
+
+    impl TempContext {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("nd-build-context-{}-{unique}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempContext {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     fn collect_lines(chunks: Vec<Vec<u8>>) -> Vec<String> {
         let (tx, rx) = std::sync::mpsc::channel();
         let reader = ChunkedReader { chunks, index: 0 };
@@ -427,6 +477,42 @@ mod tests {
             }
         }
         lines
+    }
+
+    #[test]
+    fn finds_dockerfile_in_build_context() {
+        let context = TempContext::new();
+        let dockerfile = context.path().join("Dockerfile");
+        fs::write(&dockerfile, "FROM scratch\n").unwrap();
+
+        assert_eq!(
+            build_file_for_context(context.path().to_str().unwrap()).unwrap(),
+            dockerfile
+        );
+    }
+
+    #[test]
+    fn finds_containerfile_when_dockerfile_is_missing() {
+        let context = TempContext::new();
+        let containerfile = context.path().join("Containerfile");
+        fs::write(&containerfile, "FROM scratch\n").unwrap();
+
+        assert_eq!(
+            build_file_for_context(context.path().to_str().unwrap()).unwrap(),
+            containerfile
+        );
+    }
+
+    #[test]
+    fn reports_missing_build_file_before_starting_nerdctl() {
+        let context = TempContext::new();
+        let err = build_file_for_context(context.path().to_str().unwrap()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("no Dockerfile or Containerfile found in build context")
+        );
+        assert!(err.to_string().contains(context.path().to_str().unwrap()));
     }
 
     #[test]
