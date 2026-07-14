@@ -38,20 +38,34 @@ cargo install --path .
 ## Configuration
 
 `nd` reads `nd.toml` in the working directory at startup and on refresh. Each
-`[[configs]]` entry can resolve a build tag dynamically from a remote version:
+`[[configs]]` entry can define a build context and resolve a tag dynamically from
+a remote version:
 
 ```toml
 [[configs]]
+context = "."
 # tag_template's "{version}" is replaced with the version fetched from version_url
 tag_template = "cswxn/claude:v{version}"
 version_url = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest"
 
 [[configs]]
+context = "./services/worker"
 # without version_url, tag is used as-is
-tag = "example/other:latest"
+tag = "example/worker:latest"
 ```
 
-Resolved tags are offered as a selectable list on the Build screen.
+`context` is optional; a missing or blank value uses `.`. On the Build screen,
+the effective context is chosen in this order: a manual override, the selected
+config's context, then `.`. Press `e` to edit a one-off override, `enter` to save
+it, `esc` to cancel, or `ctrl-u` to empty the draft. Saving an empty draft clears
+the override and returns to the configured/default context. Manual overrides
+last only for the current `nd` process.
+
+Relative contexts are resolved from the directory where `nd` was launched. The
+context is passed directly to `nerdctl` as one argument, so spaces are supported
+but shell expansion such as `~`, `$VAR`, or `*` is not performed.
+
+Resolved tags and contexts are offered as a selectable list on the Build screen.
 
 ## Screens & keys
 
@@ -59,7 +73,8 @@ Resolved tags are offered as a selectable list on the Build screen.
 | --- | --- |
 | Containers | `r` refresh · `tab` switch screen · `↑/↓` select · `s` start · `x` stop · `R` restart · `d` remove · `p` system prune |
 | Images | `r` refresh · `tab` switch · `↑/↓` select · `d` remove · `p` prune images · `s` push |
-| Build | `r` reload config · `tab` switch · type path · `enter` build · `backspace` delete · `ctrl-u` clear · `p` prune builder |
+| Build | `r` reload config · `tab` switch · `↑/↓` select config · `e` edit context · `enter` build · `p` prune builder |
+| Build context editor | type path · `enter` save · `esc` cancel · `backspace` delete · `ctrl-u` clear draft · `ctrl-c` force quit |
 | Tasks | `tab` switch · `↑/↓` select task · `d` remove task (cancels if running) · `c` clear finished output · `esc` cancel running task |
 | Logs | `r` refresh · `tab` switch · `c` clear logs |
 

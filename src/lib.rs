@@ -78,8 +78,30 @@ where
 fn handle_key(app: &mut App, key: KeyEvent) {
     if app.modal.is_some() {
         handle_modal_key(app, key);
+    } else if app.screen == Screen::Build && app.editing_context {
+        handle_context_edit_key(app, key);
     } else {
         handle_main_key(app, key);
+    }
+}
+
+fn handle_context_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true
+        }
+        KeyCode::Enter => app.commit_context_edit(),
+        KeyCode::Esc => app.cancel_context_edit(),
+        KeyCode::Backspace => app.pop_context_char(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.clear_context_draft()
+        }
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            app.push_context_char(character);
+        }
+        _ => {}
     }
 }
 
@@ -128,26 +150,12 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
             app.open_modal(Modal::PushImage);
         }
         KeyCode::Char('p') if app.screen == Screen::Build => app.open_modal(Modal::BuilderPrune),
+        KeyCode::Char('e') if app.screen == Screen::Build => app.begin_context_edit(),
         KeyCode::Enter if app.screen == Screen::Build => run_build(app),
-        KeyCode::Backspace if app.screen == Screen::Build => {
-            app.input.pop();
-        }
-        KeyCode::Char('u')
-            if app.screen == Screen::Build && key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            app.input.clear();
-            app.set_status("build path cleared");
-        }
         KeyCode::Char('c') if app.screen == Screen::Tasks => app.clear_selected_task_lines(),
         KeyCode::Char('c') if app.screen == Screen::Logs => app.clear_logs(),
         KeyCode::Char('d') if app.screen == Screen::Tasks => app.delete_selected_task(),
         KeyCode::Esc if app.screen == Screen::Tasks => app.cancel_selected_task(),
-        KeyCode::Char(character)
-            if app.screen == Screen::Build
-                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
-        {
-            app.input.push(character);
-        }
         _ => {}
     }
 }
@@ -190,13 +198,7 @@ fn handle_confirmation_key(app: &mut App, modal: Modal, key: KeyEvent) {
 }
 
 fn run_build(app: &mut App) {
-    let path = app.input.trim().to_string();
-
-    if path.is_empty() {
-        app.set_error("build path is required");
-        return;
-    }
-
+    let path = app.effective_build_context().to_string();
     let tag = app.selected_config().and_then(|config| config.tag.clone());
 
     match docker::build_image_stream(path.clone(), tag.clone()) {
@@ -284,4 +286,80 @@ where
     F: FnOnce() -> Result<String> + Send + 'static,
 {
     app.start_action(success_status, action);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn context_edit_mode_accepts_global_shortcut_characters() {
+        let mut app = App::new();
+        app.set_screen(Screen::Build);
+
+        handle_key(&mut app, key(KeyCode::Char('e')));
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        for character in "q/rp jk12345".chars() {
+            handle_key(&mut app, key(KeyCode::Char(character)));
+        }
+        handle_key(&mut app, key(KeyCode::Tab));
+
+        assert!(app.editing_context);
+        assert_eq!(app.screen, Screen::Build);
+        assert_eq!(app.context_draft(), "q/rp jk12345");
+        assert_eq!(app.modal, None);
+
+        handle_key(&mut app, key(KeyCode::Enter));
+
+        assert!(!app.editing_context);
+        assert_eq!(app.input, "q/rp jk12345");
+    }
+
+    #[test]
+    fn context_edit_escape_preserves_the_previous_override() {
+        let mut app = App::new();
+        app.set_screen(Screen::Build);
+        app.input = "./original".to_string();
+
+        handle_key(&mut app, key(KeyCode::Char('e')));
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut app, key(KeyCode::Char('x')));
+        handle_key(&mut app, key(KeyCode::Esc));
+
+        assert!(!app.editing_context);
+        assert_eq!(app.input, "./original");
+    }
+
+    #[test]
+    fn build_shortcuts_resume_outside_context_edit_mode() {
+        let mut app = App::new();
+        app.set_screen(Screen::Build);
+
+        handle_key(&mut app, key(KeyCode::Char('p')));
+        assert_eq!(app.modal, Some(Modal::BuilderPrune));
+
+        app.close_modal();
+        handle_key(&mut app, key(KeyCode::Char('e')));
+        assert!(app.editing_context);
+
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(app.should_quit);
+    }
 }

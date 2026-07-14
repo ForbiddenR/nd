@@ -9,7 +9,8 @@ use ratatui::{
 use crate::{
     app::{App, Modal, Screen, TaskStatus},
     consts::{
-        HELP_BUILD, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL, HELP_TASKS, SIDEBAR_ITEMS,
+        HELP_BUILD, HELP_BUILD_EDIT, HELP_CONTAINERS, HELP_IMAGES, HELP_LOGS, HELP_MODAL,
+        HELP_TASKS, SIDEBAR_ITEMS,
     },
 };
 pub fn ui(frame: &mut Frame, app: &App) {
@@ -190,25 +191,46 @@ fn render_images(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_build(frame: &mut Frame, area: Rect, app: &App) {
-    let input = if app.input.is_empty() {
-        "<enter build context path>"
-    } else {
-        app.input.as_str()
-    };
-
     let mut text = vec![
-        Line::from("Build an image with nerdctl from a local context path."),
+        Line::from("Build an image with nerdctl from a local context."),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Context path: ", Style::default().fg(Color::Yellow)),
-            Span::styled(input, Style::default().fg(Color::Cyan)),
-        ]),
-        Line::from(""),
-        Line::from("Configured tags:"),
     ];
 
+    if app.editing_context {
+        let draft = if app.context_draft().is_empty() {
+            "<empty — save to clear override>"
+        } else {
+            app.context_draft()
+        };
+        text.extend([
+            Line::from(vec![
+                Span::styled("Editing context: ", Style::default().fg(Color::Yellow)),
+                Span::styled(draft, Style::default().fg(Color::Cyan)),
+            ]),
+            Line::from("Enter saves · Esc cancels · Backspace deletes · Ctrl-U clears"),
+        ]);
+    } else {
+        text.extend([
+            Line::from(vec![
+                Span::styled("Context: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    app.effective_build_context(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Source: ", Style::default().fg(Color::Yellow)),
+                Span::raw(app.build_context_source().label()),
+            ]),
+        ]);
+    }
+
+    text.extend([Line::from(""), Line::from("Configured builds:")]);
+
     if app.configs.is_empty() {
-        text.push(Line::from("  <no configs in nd.toml>"));
+        text.push(Line::from("  <no configs in nd.toml — using context .>"));
     } else {
         for (index, config) in app.configs.iter().enumerate() {
             let marker = if index == app.selected_build_tag {
@@ -218,7 +240,6 @@ fn render_build(frame: &mut Frame, area: Rect, app: &App) {
             };
             let tag = config.tag.as_deref().unwrap_or("<no tag resolved>");
             let version = config.latest_version.as_deref().unwrap_or("<not resolved>");
-            let url = config.version_url.as_deref().unwrap_or("<no version url>");
             let style = if index == app.selected_build_tag {
                 Style::default().fg(Color::Black).bg(Color::LightYellow)
             } else {
@@ -226,19 +247,28 @@ fn render_build(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             text.push(Line::styled(
-                format!("{marker} {tag} | latest: {version} | {url}"),
+                format!(
+                    "{marker} {tag} | context: {} | latest: {version}",
+                    config.context_or_default()
+                ),
                 style,
             ));
         }
     }
 
-    text.extend([
-        Line::from(""),
-        Line::from("Use ↑/↓ to select a configured tag."),
-        Line::from("Press Enter to run `nerdctl build -t <selected-tag> <path>`."),
-        Line::from("Press r to reload nd.toml and re-resolve versions."),
-        Line::from("Press p to prune the builder cache after confirmation."),
-    ]);
+    if app.editing_context {
+        text.extend([
+            Line::from(""),
+            Line::from("Save or cancel the draft to return to build controls."),
+        ]);
+    } else {
+        text.extend([
+            Line::from(""),
+            Line::from("Use ↑/↓ to select a configured build."),
+            Line::from("Press e to edit a one-off context override."),
+            Line::from("Press Enter to build with the effective context."),
+        ]);
+    }
 
     let widget = Paragraph::new(text)
         .block(Block::default().title("Build").borders(Borders::ALL))
@@ -494,26 +524,48 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 })
                 .unwrap_or_else(|| "No image selected.".to_string()),
         ),
-        Screen::Build => Text::from(
-            app.selected_config()
-                .map(|config| {
-                    format!(
-                        "Build context path\n{}\n\nTag template\n{}\n\nLatest version\n{}\n\nResolved tag\n{}",
-                        if app.input.is_empty() {
-                            "No path entered."
+        Screen::Build => {
+            let mut lines = if app.editing_context {
+                vec![
+                    Line::from(format!(
+                        "Editing · {}",
+                        if app.context_draft().is_empty() {
+                            "<empty>"
                         } else {
-                            app.input.as_str()
-                        },
-                        config
-                            .tag_template
-                            .as_deref()
-                            .unwrap_or("No tag template."),
-                        config.latest_version.as_deref().unwrap_or("Not resolved."),
-                        config.tag.as_deref().unwrap_or("No tag resolved.")
-                    )
-                })
-                .unwrap_or_else(|| "No build config selected.".to_string()),
-        ),
+                            app.context_draft()
+                        }
+                    )),
+                    Line::from(format!(
+                        "Current · {} [{}]",
+                        app.effective_build_context(),
+                        app.build_context_source().label()
+                    )),
+                ]
+            } else {
+                vec![Line::from(format!(
+                    "Context · {} [{}]",
+                    app.effective_build_context(),
+                    app.build_context_source().label()
+                ))]
+            };
+
+            if let Some(config) = app.selected_config() {
+                lines.push(Line::from(format!(
+                    "Tag · {}",
+                    config.tag.as_deref().unwrap_or("<no tag resolved>")
+                )));
+                if !app.editing_context {
+                    lines.push(Line::from(format!(
+                        "Version · {}",
+                        config.latest_version.as_deref().unwrap_or("<not resolved>")
+                    )));
+                }
+            } else {
+                lines.push(Line::from("Tag · <none>"));
+            }
+
+            Text::from(lines)
+        }
         Screen::Tasks => {
             let running = app.tasks.iter().filter(|task| task.is_running()).count();
             let total = app.tasks.len();
@@ -549,6 +601,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.screen {
         Screen::Containers => HELP_CONTAINERS,
         Screen::Images => HELP_IMAGES,
+        Screen::Build if app.editing_context => HELP_BUILD_EDIT,
         Screen::Build => HELP_BUILD,
         Screen::Tasks => HELP_TASKS,
         Screen::Logs => HELP_LOGS,
@@ -679,7 +732,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     use super::*;
-    use crate::app::{Task, TaskKind};
+    use crate::{
+        app::{Task, TaskKind},
+        config::Config,
+    };
 
     fn task(kind: TaskKind, title: &str, status: TaskStatus, lines: &[&str]) -> Task {
         let mut task = Task::new(kind, title.to_string());
@@ -703,11 +759,29 @@ mod tests {
         app
     }
 
+    fn build_config(context: Option<&str>, tag: &str) -> Config {
+        Config {
+            context: context.map(str::to_string),
+            tag: Some(tag.to_string()),
+            latest_version: Some("1.2.3".to_string()),
+            ..Config::default()
+        }
+    }
+
     fn render_tasks_buffer(width: u16, height: u16, app: &App) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| render_tasks(frame, frame.area(), app))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_build_buffer(width: u16, height: u16, app: &App) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_build(frame, frame.area(), app))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -747,6 +821,55 @@ mod tests {
                 line
             })
             .collect()
+    }
+
+    #[test]
+    fn build_screen_shows_default_context_without_config() {
+        let mut app = App::new();
+        app.screen = Screen::Build;
+
+        let rendered = buffer_lines(&render_app_buffer(90, 28, &app)).join("\n");
+        assert!(rendered.contains("Context: ."));
+        assert!(rendered.contains("Source: default"));
+        assert!(rendered.contains("no configs in nd.toml"));
+        assert!(rendered.contains("Context · . [default]"));
+        assert!(rendered.contains("e edit context"));
+    }
+
+    #[test]
+    fn build_screen_shows_configured_and_manual_context_sources() {
+        let mut app = App::new();
+        app.configs = vec![
+            build_config(Some(" ./configured "), "example:first"),
+            build_config(None, "example:second"),
+        ];
+
+        let configured = buffer_lines(&render_build_buffer(90, 16, &app)).join("\n");
+        assert!(configured.contains("Context: ./configured"));
+        assert!(configured.contains("Source: configured"));
+        assert!(configured.contains("example:first | context: ./configured"));
+        assert!(configured.contains("example:second | context: ."));
+
+        app.input = " ./manual path ".to_string();
+        let manual = buffer_lines(&render_build_buffer(90, 16, &app)).join("\n");
+        assert!(manual.contains("Context: ./manual path"));
+        assert!(manual.contains("Source: manual"));
+    }
+
+    #[test]
+    fn build_screen_distinguishes_context_edit_mode() {
+        let mut app = App::new();
+        app.screen = Screen::Build;
+        app.begin_context_edit();
+        app.clear_context_draft();
+        for character in "q/rp-jk12345".chars() {
+            app.push_context_char(character);
+        }
+
+        let rendered = buffer_lines(&render_app_buffer(90, 28, &app)).join("\n");
+        assert!(rendered.contains("Editing context: q/rp-jk12345"));
+        assert!(rendered.contains("enter save"));
+        assert!(rendered.contains("ctrl-u clear"));
     }
 
     #[test]

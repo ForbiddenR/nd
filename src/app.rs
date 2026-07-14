@@ -57,6 +57,23 @@ pub enum Modal {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildContextSource {
+    Manual,
+    Configured,
+    Default,
+}
+
+impl BuildContextSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Configured => "configured",
+            Self::Default => "default",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Container {
     pub id: String,
@@ -244,6 +261,8 @@ pub struct App {
     pub status: String,
     pub logs: Vec<String>,
     pub input: String,
+    pub editing_context: bool,
+    context_draft: String,
     pub configs: Vec<config::Config>,
     pub tasks: Vec<Task>,
     pub selected_task: usize,
@@ -266,6 +285,8 @@ impl App {
             status: "ready".to_string(),
             logs: Vec::new(),
             input: String::new(),
+            editing_context: false,
+            context_draft: String::new(),
             configs: vec![],
             tasks: Vec::new(),
             selected_task: 0,
@@ -483,6 +504,71 @@ impl App {
         self.configs.get(self.selected_build_tag)
     }
 
+    pub fn effective_build_context(&self) -> &str {
+        let manual = self.input.trim();
+        if !manual.is_empty() {
+            manual
+        } else {
+            self.selected_config()
+                .map(config::Config::context_or_default)
+                .unwrap_or(".")
+        }
+    }
+
+    pub fn build_context_source(&self) -> BuildContextSource {
+        if !self.input.trim().is_empty() {
+            BuildContextSource::Manual
+        } else if self
+            .selected_config()
+            .and_then(|config| config.context.as_deref())
+            .is_some_and(|context| !context.trim().is_empty())
+        {
+            BuildContextSource::Configured
+        } else {
+            BuildContextSource::Default
+        }
+    }
+
+    pub fn context_draft(&self) -> &str {
+        &self.context_draft
+    }
+
+    pub fn begin_context_edit(&mut self) {
+        self.context_draft = self.effective_build_context().to_string();
+        self.editing_context = true;
+        self.status = "editing build context".to_string();
+    }
+
+    pub fn push_context_char(&mut self, character: char) {
+        self.context_draft.push(character);
+    }
+
+    pub fn pop_context_char(&mut self) {
+        self.context_draft.pop();
+    }
+
+    pub fn clear_context_draft(&mut self) {
+        self.context_draft.clear();
+    }
+
+    pub fn commit_context_edit(&mut self) {
+        self.input = self.context_draft.trim().to_string();
+        self.context_draft.clear();
+        self.editing_context = false;
+        self.status = if self.input.is_empty() {
+            "build context override cleared"
+        } else {
+            "build context override saved"
+        }
+        .to_string();
+    }
+
+    pub fn cancel_context_edit(&mut self) {
+        self.context_draft.clear();
+        self.editing_context = false;
+        self.status = "build context edit cancelled".to_string();
+    }
+
     pub fn selected_task(&self) -> Option<&Task> {
         self.tasks.get(self.selected_task)
     }
@@ -697,4 +783,82 @@ fn spawn_refresh() -> Receiver<RefreshEvent> {
         });
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, BuildContextSource};
+    use crate::config::Config;
+
+    fn config(context: Option<&str>) -> Config {
+        Config {
+            context: context.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn build_context_uses_manual_configured_then_default_precedence() {
+        let mut app = App::new();
+        assert_eq!(app.effective_build_context(), ".");
+        assert_eq!(app.build_context_source(), BuildContextSource::Default);
+
+        app.configs = vec![config(Some(" ./first ")), config(Some("./second"))];
+        assert_eq!(app.effective_build_context(), "./first");
+        assert_eq!(app.build_context_source(), BuildContextSource::Configured);
+
+        app.selected_build_tag = 1;
+        assert_eq!(app.effective_build_context(), "./second");
+
+        app.input = " ./manual ".to_string();
+        assert_eq!(app.effective_build_context(), "./manual");
+        assert_eq!(app.build_context_source(), BuildContextSource::Manual);
+    }
+
+    #[test]
+    fn blank_contexts_fall_back_to_default() {
+        let mut app = App::new();
+        app.configs = vec![config(Some("   "))];
+        app.input = "\t".to_string();
+
+        assert_eq!(app.effective_build_context(), ".");
+        assert_eq!(app.build_context_source(), BuildContextSource::Default);
+    }
+
+    #[test]
+    fn context_edit_commit_trims_and_empty_commit_clears_override() {
+        let mut app = App::new();
+        app.configs = vec![config(Some("./configured"))];
+        app.begin_context_edit();
+        app.clear_context_draft();
+        for character in "  ./manual path  ".chars() {
+            app.push_context_char(character);
+        }
+        app.commit_context_edit();
+
+        assert_eq!(app.input, "./manual path");
+        assert_eq!(app.effective_build_context(), "./manual path");
+        assert!(!app.editing_context);
+
+        app.begin_context_edit();
+        app.clear_context_draft();
+        app.commit_context_edit();
+
+        assert!(app.input.is_empty());
+        assert_eq!(app.effective_build_context(), "./configured");
+    }
+
+    #[test]
+    fn cancelling_context_edit_preserves_manual_override() {
+        let mut app = App::new();
+        app.input = "./original".to_string();
+        app.begin_context_edit();
+        app.push_context_char('x');
+        app.cancel_context_edit();
+
+        assert_eq!(app.input, "./original");
+        assert_eq!(app.effective_build_context(), "./original");
+        assert!(app.context_draft().is_empty());
+        assert!(!app.editing_context);
+    }
 }

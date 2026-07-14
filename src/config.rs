@@ -15,10 +15,21 @@ pub struct BuildConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    pub context: Option<String>,
     pub tag_template: Option<String>,
     pub tag: Option<String>,
     pub latest_version: Option<String>,
     pub version_url: Option<String>,
+}
+
+impl Config {
+    pub fn context_or_default(&self) -> &str {
+        self.context
+            .as_deref()
+            .map(str::trim)
+            .filter(|context| !context.is_empty())
+            .unwrap_or(".")
+    }
 }
 
 pub fn read_build_config() -> Result<BuildConfig> {
@@ -93,6 +104,7 @@ mod tests {
     fn parses_config_list() {
         let contents = r#"
 [[configs]]
+context = " ./example "
 tag_template = "example/app:{version}"
 version_url = "https://registry.npmjs.org/example/latest"
 
@@ -103,6 +115,8 @@ tag = "example/other:latest"
         let config = toml::from_str::<BuildConfig>(contents).unwrap();
 
         assert_eq!(config.configs.len(), 2);
+        assert_eq!(config.configs[0].context_or_default(), "./example");
+        assert_eq!(config.configs[1].context_or_default(), ".");
         assert_eq!(
             config.configs[0].tag_template,
             Some("example/app:{version}".to_string())
